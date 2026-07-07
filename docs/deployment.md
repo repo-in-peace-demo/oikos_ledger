@@ -4,8 +4,8 @@
 
 | Environment | Frontend | Database | Notes |
 |---|---|---|---|
-| Development | `localhost:3000` | Aurora PostgreSQL (ap-south-1) | `.env.local` |
-| Production | Vercel (auto-deploy on push to `main`) | Aurora PostgreSQL (ap-south-1) | Vercel environment variables |
+| Development | `localhost:3000` | CockroachDB Cloud (Mumbai / ap-south-1) | `.env.local` |
+| Production | Vercel (auto-deploy on push to `main`) | CockroachDB Cloud (Mumbai / ap-south-1) | Vercel environment variables |
 
 ---
 
@@ -17,7 +17,7 @@ Deployments are triggered automatically on push to `main`.
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | Aurora Transaction pooler connection string (port 6543) |
+| `DATABASE_URL` | CockroachDB Cloud Postgres-wire-compatible connection string |
 | `AUTH_SECRET` | NextAuth JWT signing secret |
 | `AUTH_GOOGLE_ID` | Google OAuth client ID |
 | `AUTH_GOOGLE_SECRET` | Google OAuth client secret |
@@ -93,29 +93,14 @@ Lambda execution role (`oikos-ledger-lambda-role`) requires:
 
 ---
 
-## Database (Aurora PostgreSQL)
+## Database (CockroachDB Cloud)
 
-**Cluster:** `oikos-ledger` (ap-south-1)  
-**Engine:** Aurora PostgreSQL Serverless v2  
-**Extensions:** pgvector, postgis, pg_trgm
+**Cluster:** `oikos-ledger` (CockroachDB Cloud, Basic tier, Mumbai / ap-south-1)  
+**Native support:** Distributed Vector Indexing (VECTOR columns), spatial types (GEOMETRY/GEOGRAPHY, PostGIS-compatible subset — see ADR 014), pg_trgm-equivalent trigram search
 
 ### Before demo recording
 
-Set minimum ACU to 0.5 to prevent cold-start pauses:
-
-```bash
-aws rds modify-db-cluster \
-  --db-cluster-identifier oikos-ledger \
-  --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=4
-```
-
-Reset to 0 after demo to minimise cost:
-
-```bash
-aws rds modify-db-cluster \
-  --db-cluster-identifier oikos-ledger \
-  --serverless-v2-scaling-configuration MinCapacity=0,MaxCapacity=4
-```
+CockroachDB Cloud Basic tier autoscales on demand — there is no manual min/max capacity knob to set before a demo, and no cold-start pause behaviour to work around.
 
 ### Schema changes
 

@@ -2,12 +2,12 @@
 
 ## Overview
 
-Oikos Ledger has two primary runtimes connected by a shared Aurora PostgreSQL database:
+Oikos Ledger has two primary runtimes connected by a shared CockroachDB Cloud database:
 
 - **Python (AWS Lambda)** — CSV ingestion, two-stage normalisation, embedding generation, balance verification
 - **Next.js (Vercel)** — UI, authentication, Route Handlers, agentic NL→SQL, voice interface, real-time dashboard queries
 
-Both runtimes talk to the same Aurora PostgreSQL cluster. Python owns all ingestion writes; Next.js owns all reads and insights writes.
+Both runtimes talk to the same CockroachDB Cloud cluster. Python owns all ingestion writes; Next.js owns all reads and insights writes.
 
 ---
 
@@ -23,9 +23,9 @@ Browser
   │     ├── OpenAI Realtime API (voice WebSocket)             │
   │     └── OpenAI API (agentic NL→SQL, embeddings, TTS)      │
   │                                                            ▼
-  │                                                   Aurora PostgreSQL
-  │                                                   (ap-south-1)
-  │                                                   pgvector · postgis
+  │                                                   CockroachDB Cloud
+  │                                                   (Mumbai / ap-south-1)
+  │                                                   vector · spatial
   │                                                            ▲
   └── CSV upload ──► S3 bucket                                 │
                        │                                       │
@@ -45,7 +45,7 @@ Browser
 ### Frontend — Next.js / Vercel
 
 - App Router with route groups: `(auth)` for unauthenticated pages, `(dashboard)` for protected pages
-- Drizzle ORM connects to Aurora via the Transaction pooler connection string (`DATABASE_URL`)
+- Drizzle ORM connects to CockroachDB Cloud via a Postgres-wire-compatible connection string (`DATABASE_URL`)
 - shadcn/ui component library with Tailwind CSS
 - Route Handlers at `app/api/` serve all data to the frontend
 
@@ -167,7 +167,7 @@ turn_detection: {
 **Flow:**
 ```
 S3 upload → Lambda → Parse CSV → Balance Verify →
-Normalise (Deterministic + LLM) → Embed → Write Aurora
+Normalise (Deterministic + LLM) → Embed → Write CockroachDB
 ```
 
 **Stage 1: CSV Parsing**
@@ -208,22 +208,22 @@ Normalise (Deterministic + LLM) → Embed → Write Aurora
 
 ---
 
-### Database — Aurora PostgreSQL Serverless v2
+### Database — CockroachDB Cloud
 
-**Cluster:** `oikos-ledger` (ap-south-1)  
-**Min ACU:** 0 (dev) — set to 0.5 before demo  
-**Max ACU:** 4  
-**Extensions:** pgvector, postgis, pg_trgm
+**Cluster:** `oikos-ledger` (CockroachDB Cloud, Basic tier, Mumbai / ap-south-1)  
+**Native support:** Distributed Vector Indexing (VECTOR columns), spatial types (GEOMETRY/GEOGRAPHY, PostGIS-compatible subset — see ADR 014), pg_trgm-equivalent trigram search
 
 **Connection strategy:**
 
-| Context | Connection string | Pooler |
-|---|---|---|
-| Scripts / local dev | `DATABASE_URL_DIRECT` | Session pooler (port 5432) |
-| Lambda | `DATABASE_URL` | Transaction pooler (port 6543) |
-| Next.js Route Handlers | `DATABASE_URL` | Transaction pooler (port 6543) |
+| Context | Connection string |
+|---|---|
+| Scripts / local dev | `DATABASE_URL_DIRECT` |
+| Lambda | `DATABASE_URL` |
+| Next.js Route Handlers | `DATABASE_URL` |
 
-**SSL:** `rejectUnauthorized: false` (CA cert path issues in Lambda container) — production fix: bundle `global-bundle.pem` in Docker image.
+CockroachDB Cloud handles connection pooling itself — no separate proxy or pooler tier required (see ADR 014).
+
+**SSL:** `sslmode=require` (CockroachDB Cloud enforces TLS) — bundle CockroachDB Cloud's CA certificate in the Lambda Docker image for production.
 
 ---
 
@@ -252,4 +252,9 @@ Normalise (Deterministic + LLM) → Embed → Write Aurora
 | Deterministic bank-specific parsers over LLM-based format detection | ADR 005 |
 | Full pipeline idempotency at the database level | ADR 006 |
 | Two-stage normalisation — deterministic first, LLM second | ADR 007 |
-| Agentic NL→SQL with run_sql tool over classify→generateSQL two-step | ADR 008 |
+| setInterval over SWR for upload status polling | ADR 009 |
+| Deterministic-first normalisation strategy | ADR 010 |
+| row_number for intra-day transaction ordering | ADR 011 |
+| Agentic NL→SQL with run_sql tool over classify→generateSQL two-step | ADR 012 |
+| OpenAI Realtime API for voice interface | ADR 013 |
+| Aurora PostgreSQL → CockroachDB migration for agentic memory | ADR 014 |

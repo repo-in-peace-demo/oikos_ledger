@@ -1,7 +1,7 @@
 # ADR 008: Aurora PostgreSQL over Supabase
 
 ## Status
-Accepted
+Accepted — Superseded by ADR 014. Remains an accurate record of the original Supabase→Aurora migration and should not be edited otherwise.
 
 ## Context
 Initial development used Supabase (PostgreSQL hosted service)

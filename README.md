@@ -8,6 +8,19 @@ Oikos Ledger is a conversational personal finance app that turns Indian bank sta
 
 ---
 
+## Project Lineage
+
+This project extends [Oikos Ledger](https://github.com/sl2902/oikos_ledger), a personal finance app originally built for the **AWS + Vercel Hackathon 2026** (Track 1 B2C), submitted June 29, 2026.
+
+Everything built between **June 30 and August 18, 2026** — the CockroachDB × AWS Hackathon Submission Period — is new:
+- The CockroachDB-backed agentic memory layer
+- The Macro page
+- Multi-account comparison
+
+The pre-existing Oikos Ledger codebase — auth, core data model, UI shell — is unchanged and predates this period.
+
+---
+
 ## What it does
 
 - **Multi-bank ingestion** — upload CSV statements from HDFC, ICICI, and Axis Bank. The pipeline parses each bank's unique format, normalises merchant names, categorises transactions, and validates opening and closing balances row by row.
@@ -34,6 +47,16 @@ Oikos Ledger is a conversational personal finance app that turns Indian bank sta
 ## Data model
 
 ![Oikos Ledger Data Model](https://github.com/sl2902/oikos_ledger/blob/main/assets/oikos_ledger_er_v1.png)
+
+---
+
+## The Memory Lifecycle
+
+The agentic memory layer is built around a three-stage design:
+
+1. **Ingestion** — episodic events such as insight cards, macro explanations, and comparison runs are captured as immutable records in CockroachDB.
+2. **Distillation** — a hybrid trigger keeps memory useful without unbounded growth: cheap running metrics (occurrence ratios, means, threshold-confirmation) are updated inline at write time, while a scheduled Lambda job handles heavier trend extraction, percentile calculations, and decay.
+3. **Synthesis** — the agent queries the semantic table, which returns distilled context weighted by relevance and recency, so infrequently-relevant facts fade without being deleted outright.
 
 ---
 
@@ -65,6 +88,16 @@ If you want to start fresh as a guest:
 - **Analytics** — merchant breakdown, payment method trends, subcategory drilldown, debit vs credit
 
 > Note: Demo statements have been uploaded until July 15 to ensure recommendations show live current-month data during the judging period.
+
+---
+
+## Hackathon Requirements
+
+| Requirement | What was used |
+|---|---|
+| CockroachDB tool #1 | Managed MCP Server (agent memory read/write) |
+| CockroachDB tool #2 | Distributed Vector Indexing (semantic recall over past insights) |
+| AWS service | Lambda, Python 3.12 (scheduled batch distillation job) |
 
 ---
 

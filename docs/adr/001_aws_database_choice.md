@@ -1,6 +1,6 @@
 # ADR 001 — AWS Database Choice: Aurora PostgreSQL
 
-**Status:** Accepted
+**Status:** Accepted — Superseded by ADR 014 for the CockroachDB × AWS Hackathon extension. This ADR remains an accurate record of the original AWS + Vercel Hackathon decision and should not be edited otherwise.
 
 ## Context
 

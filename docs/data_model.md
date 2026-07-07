@@ -7,7 +7,7 @@ All 13 custom tables are implemented and verified. Defined in two places:
 - **Python** — `ingestion/models/` (SQLModel classes, authoritative for table creation)
 - **TypeScript** — `app/lib/db/schema.ts` (Drizzle schema, mirrors Python for type-safe reads)
 
-> **Note on `spatial_ref_sys`:** PostGIS creates this system table. It appears in the Supabase/Aurora table editor alongside the 13 custom tables but is not part of the Oikos Ledger schema.
+> **Note on `spatial_ref_sys`:** PostGIS creates this system table. It appears in the Supabase/Aurora/CockroachDB Cloud table editor alongside the 13 custom tables but is not part of the Oikos Ledger schema.
 
 ---
 

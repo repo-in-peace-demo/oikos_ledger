@@ -8,10 +8,10 @@ All data in transit is encrypted via TLS.
 |---|---|
 | Browser → Vercel | HTTPS enforced; HTTP redirected automatically by Vercel |
 | Browser → OpenAI Realtime API | WSS (WebSocket Secure) — ephemeral key fetched server-side, expires in 60s |
-| Next.js → Aurora | TLS on all PostgreSQL connections via `sslmode=require` |
+| Next.js → CockroachDB | TLS on all PostgreSQL connections via `sslmode=require` |
 | Next.js → S3 | HTTPS via AWS SDK (cannot be disabled) |
 | Next.js → OpenAI API | HTTPS |
-| Lambda → Aurora | TLS on all PostgreSQL connections |
+| Lambda → CockroachDB | TLS on all PostgreSQL connections |
 | Lambda → S3 | HTTPS via AWS SDK |
 
 ---
@@ -31,11 +31,11 @@ Bucket: `oikos-ledger-uploads`
 
 CSV files are the most sensitive data in the system. Stored in S3 for Lambda processing only; never served back to users.
 
-### Database — Development (Aurora PostgreSQL)
+### Database — Development (CockroachDB Cloud)
 
-Aurora PostgreSQL encrypts data at rest by default (AES-256, AWS KMS with AWS-managed keys). This applies to storage volumes, snapshots, read replicas, and automated backups.
+CockroachDB Cloud encrypts data at rest by default (AES-256). This applies to storage volumes, snapshots, and automated backups.
 
-Previously used Supabase free tier (no encryption at rest) — now replaced by Aurora for all environments.
+Previously used Supabase free tier (no encryption at rest) — since migrated to CockroachDB Cloud for all environments (see ADR 014).
 
 ### Query Cache
 
@@ -109,13 +109,12 @@ Cached query results stored in `query_cache` table include SQL queries and resul
 
 | # | Gap | Risk | Mitigation / Fix |
 |---|---|---|---|
-| 1 | `rejectUnauthorized: false` for Aurora SSL | Certificate not verified — encrypted but not authenticated | Bundle `global-bundle.pem` in Lambda Docker image and Vercel repo |
+| 1 | `rejectUnauthorized: false` for CockroachDB SSL | Certificate not verified — encrypted but not authenticated | Bundle CockroachDB Cloud's CA certificate in Lambda Docker image and Vercel repo |
 | 2 | No rate limiting on API routes | Upload endpoint could be abused | Add rate limiting middleware before production launch |
 | 3 | No file content validation beyond extension check | Malicious file uploaded as CSV | Lambda handles parsing errors gracefully; no execution of uploaded content |
 | 4 | `AUTH_SECRET` rotation not enforced | If compromised, all active sessions affected | Rotate secret; all sessions automatically invalidated |
 | 5 | No audit log for data access | No visibility into who accessed what | `transaction_amendments` provides a partial trail; full access logging is a future feature |
-| 6 | No RDS Proxy | Lambda uses long-lived IAM credentials with direct Aurora connections | Add RDS Proxy for production |
-| 7 | OpenAI API key in environment variable | If Vercel environment is compromised, key is exposed | Use secrets manager (AWS Secrets Manager or Vercel secrets) for production |
+| 6 | OpenAI API key in environment variable | If Vercel environment is compromised, key is exposed | Use secrets manager (AWS Secrets Manager or Vercel secrets) for production |
 
 ---
 
