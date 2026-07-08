@@ -6,6 +6,7 @@ import {
   boolean,
   customType,
   date,
+  doublePrecision,
   integer,
   json,
   jsonb,
@@ -55,6 +56,7 @@ export const macroIndicatorEnum = pgEnum("macro_indicator", [
   "inflation",
   "food_inflation",
   "gdp_per_capita",
+  "repo_rate",
 ]);
 
 export const recommendationTypeEnum = pgEnum("recommendation_type", [
@@ -191,6 +193,53 @@ export const macro_economic_data = pgTable("macro_economic_data", {
 }, (table) => ({
   uqCountryIndicatorPeriod: uniqueIndex("uq_macro_country_indicator_period")
     .on(table.country_code, table.indicator, table.period),
+}));
+
+export const episodic_events = pgTable("episodic_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  user_id: uuid("user_id").notNull().references(() => users.id),
+  account_id: uuid("account_id").references(() => bank_accounts.id),
+  event_type: text("event_type").notNull(), // macro_explanation | insight_shown | comparison_run | ...
+  content: text("content").notNull(),
+  embedding: vector("embedding", { dimensions: 1536 }).notNull(),
+  metadata: json("metadata").$type<Record<string, unknown>>(),
+  created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  // no updated_at — append-only/immutable table, never updated after insert
+});
+
+export const semantic_facts = pgTable("semantic_facts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  user_id: uuid("user_id").notNull().references(() => users.id),
+  // NULL = user-level fact (e.g. Macro-feature facts, not tied to one account).
+  // Non-NULL = account-specific fact (e.g. Compare-feature per-account category baselines).
+  // Deliberately kept nullable rather than a sentinel "no account" UUID — see the NULL-uniqueness
+  // caveat on the index below, and ingestion/models/memory.py for the full explanation.
+  account_id: uuid("account_id").references(() => bank_accounts.id),
+  fact_type: text("fact_type").notNull(),
+  category: text("category"),
+  description: text("description").notNull(),
+  embedding: vector("embedding", { dimensions: 1536 }).notNull(),
+  occurrence_count: integer("occurrence_count").notNull().default(0),
+  opportunity_count: integer("opportunity_count").notNull().default(0),
+  running_mean: doublePrecision("running_mean"),
+  confidence_status: text("confidence_status").notNull().default("tentative"),
+  relevance_score: doublePrecision("relevance_score").notNull().default(1.0),
+  last_accessed_at: timestamp("last_accessed_at", { withTimezone: true }).notNull().defaultNow(),
+  superseded_by: uuid("superseded_by").references((): AnyPgColumn => semantic_facts.id),
+  created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  // Partial unique index — only one *active* fact per (user, account, fact_type, category);
+  // superseded rows keep the same key with superseded_by pointing at the new row.
+  //
+  // NULL-uniqueness caveat: Postgres/CockroachDB never treat two NULLs as equal for uniqueness,
+  // so two user-level rows (account_id IS NULL) with the same user/fact_type/category would NOT
+  // collide here. This is handled at the application level, not with a sentinel value — see the
+  // detailed comment in ingestion/models/memory.py (the authoritative definition; create_tables.py
+  // owns migrations).
+  uqUserFactCategoryActive: uniqueIndex("uq_semantic_facts_user_fact_category_active")
+    .on(table.user_id, table.account_id, table.fact_type, table.category)
+    .where(sql`superseded_by IS NULL`),
 }));
 
 export const insights = pgTable("insights", {

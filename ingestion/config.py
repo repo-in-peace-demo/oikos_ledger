@@ -6,6 +6,12 @@ Import the shared `settings` instance — never instantiate Settings() directly:
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+# from sqlalchemy.dialects.postgresql.base import PGDialect
+
+# # --- Monkeypatch for CockroachDB ---
+# def apply_cockroach_patches():
+#     """Bypasses version check for CockroachDB compatibility."""
+#     PGDialect._get_server_version_info = lambda *args: (15, 0, 0)
 
 
 class Settings(BaseSettings):
@@ -55,3 +61,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# if settings.db_provider == 'cockroach':
+#     apply_cockroach_patches()

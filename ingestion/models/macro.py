@@ -15,6 +15,7 @@ class MacroIndicator(str, Enum):
     inflation = "inflation"
     food_inflation = "food_inflation"
     gdp_per_capita = "gdp_per_capita"
+    repo_rate = "repo_rate"
 
 
 class MacroEconomicData(SQLModel, table=True):

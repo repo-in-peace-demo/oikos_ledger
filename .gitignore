@@ -25,6 +25,9 @@ tests/fixture/statements/*
 # pem
 **/global-bundle.pem
 
+# certs
+**/certs/*
+
 # misc
 output.json
 scripts/test_hdfc.csv

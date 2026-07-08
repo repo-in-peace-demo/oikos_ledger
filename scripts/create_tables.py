@@ -18,6 +18,16 @@ def main() -> None:
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:
+        # Macro indicator enum: repo_rate added for the RBI repo rate series (see
+        # ingestion/models/macro.py). create_all() only creates missing tables/types, it never
+        # adds a missing enum value to an already-existing type, so this must be done explicitly.
+        # SQLModel/SQLAlchemy's default enum type name is the lowercased Python class name with
+        # no separator — MacroIndicator -> "macroindicator", not "macro_indicator".
+        session.exec(text("""
+            ALTER TYPE macroindicator ADD VALUE IF NOT EXISTS 'repo_rate'
+        """))
+        session.commit()
+
         # Unique constraint 1: reference number (partial — only when not null)
         session.exec(text("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_ref
@@ -38,6 +48,61 @@ def main() -> None:
                 amount, "transaction_type", "raw_description",
                 "closing_balance"
             )
+        """))
+
+        # Semantic facts: account_id (nullable — NULL means user-level, e.g. Macro facts;
+        # non-NULL scopes a fact to one account, e.g. Compare per-account baselines). Replaces
+        # the old `category_baseline::<account_id>` string-encoding convention with a real column.
+        #
+        # The FK is added as a separate, explicitly-named, existence-checked step — ADD COLUMN
+        # IF NOT EXISTS only guards the column itself, not an inline REFERENCES clause, so
+        # combining them here previously added a second FK constraint
+        # (semantic_facts_account_id_fkey_1) every time this script was re-run after the column
+        # already existed.
+        session.exec(text("""
+            ALTER TABLE semantic_facts ADD COLUMN IF NOT EXISTS account_id UUID
+        """))
+
+        existing_fk = session.exec(text("""
+            SELECT constraint_name FROM information_schema.table_constraints
+            WHERE table_name = 'semantic_facts'
+              AND constraint_type = 'FOREIGN KEY'
+              AND constraint_name = 'semantic_facts_account_id_fkey'
+        """)).first()
+
+        if existing_fk is None:
+            session.exec(text("""
+                ALTER TABLE semantic_facts
+                ADD CONSTRAINT semantic_facts_account_id_fkey
+                FOREIGN KEY (account_id) REFERENCES bank_accounts(id)
+            """))
+
+        # Only one *active* fact per (user_id, account_id, fact_type, category). The distillation
+        # job supersedes a fact by inserting a new row and pointing the old row's superseded_by
+        # at it, rather than updating in place — so the uniqueness constraint must be partial
+        # (superseded_by IS NULL), not a plain unique index.
+        #
+        # NULL-uniqueness caveat: two user-level rows (account_id IS NULL) with the same
+        # user_id/fact_type/category will NOT collide on this index — Postgres/CockroachDB never
+        # treat two NULLs as equal for uniqueness. This is handled at the application level in
+        # distillation/pipeline/distiller.py (upsert_or_supersede_fact looks up the existing
+        # active row, matching NULL account_id with `.is_(None)`, before deciding to insert),
+        # not with a sentinel "no account" value — see ingestion/models/memory.py for why a
+        # sentinel doesn't work here (it would break the account_id foreign key).
+        # Drop both possible prior names: the original plain index (still live as of this
+        # writing) and the intermediate partial-without-account_id name, in case that
+        # intermediate migration was ever applied elsewhere.
+        session.exec(text("""
+            DROP INDEX IF EXISTS uq_semantic_facts_user_fact_category CASCADE
+        """))
+        session.exec(text("""
+            DROP INDEX IF EXISTS uq_semantic_facts_user_fact_category_active CASCADE
+        """))
+
+        session.exec(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_semantic_facts_user_fact_category_active
+            ON semantic_facts (user_id, account_id, fact_type, category)
+            WHERE superseded_by IS NULL
         """))
 
         # Insights query cache: simple key-value cache keyed by account+user+question

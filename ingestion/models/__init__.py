@@ -1,6 +1,7 @@
 """Exports all SQLModel table models and enums for use by the ingestion pipeline and scripts."""
 
 from .macro import MacroEconomicData, MacroIndicator
+from .memory import EpisodicEvent, SemanticFact
 from .recommendations import (
     Insight,
     QueryCache,
@@ -39,6 +40,9 @@ __all__ = [
     # macro
     "MacroEconomicData",
     "MacroIndicator",
+    # memory
+    "EpisodicEvent",
+    "SemanticFact",
     # recommendations
     "Insight",
     "Recommendation",

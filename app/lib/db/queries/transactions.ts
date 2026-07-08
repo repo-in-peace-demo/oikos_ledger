@@ -18,6 +18,30 @@ export async function getTransactionsByAccount(
     .offset(offset)
 }
 
+// Most recent closing balance for an account, and the YYYY-MM month it's from. Returns null if
+// the account has no transactions at all (caller should exclude it, not treat it as a zero balance).
+export async function getLatestAccountBalance(userId: string, accountId: string): Promise<{
+  closing_balance: number
+  as_of_month: string
+} | null> {
+  const [row] = await db
+    .select({
+      closing_balance: transactions.closing_balance,
+      transaction_date: transactions.transaction_date,
+    })
+    .from(transactions)
+    .where(and(eq(transactions.user_id, userId), eq(transactions.account_id, accountId)))
+    .orderBy(desc(transactions.transaction_date), desc(transactions.row_number))
+    .limit(1)
+
+  if (!row || row.closing_balance == null) return null
+
+  return {
+    closing_balance: Number(row.closing_balance),
+    as_of_month: row.transaction_date.slice(0, 7), // "YYYY-MM-DD" -> "YYYY-MM"
+  }
+}
+
 export async function getUploadByHash(userId: string, accountId: string, fileHash: string) {
   return db
     .select()

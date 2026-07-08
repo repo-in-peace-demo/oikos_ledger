@@ -10,7 +10,7 @@ const NAV_ITEMS: { href: string; label: string; icon: React.ElementType; disable
   { href: "/insights", label: "Insights", icon: Lightbulb },
   { href: "/recommendations", label: "Recommendations", icon: Sparkles },
   { href: "/analytics", label: "Analytics", icon: BarChart2 },
-  { href: "/macro", label: "Macro Context (Coming Soon)", icon: Globe, disabled: true },
+  { href: "/macro", label: "Macro Context", icon: Globe },
 ]
 
 interface Props {

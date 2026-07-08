@@ -4,8 +4,9 @@
 
 set -e
 
-ROLE_NAME="oikos-ledger-lambda-role"
+ROLE_NAME="oikos-recall-lambda-role"
 REGION=${AWS_REGION:-ap-south-1}
+AWS_PROFILE=${AWS_PROFILE:-}
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # Create trust policy
@@ -48,7 +49,12 @@ cat > /tmp/s3-policy.json << EOF
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::oikos-ledger-uploads/*"
+      "Resource": "arn:aws:s3:::oikos-recall-uploads/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::oikos-recall-uploads"
     }
   ]
 }
@@ -57,7 +63,7 @@ EOF
 # Attach S3 policy
 aws iam put-role-policy \
   --role-name ${ROLE_NAME} \
-  --policy-name oikos-ledger-s3-access \
+  --policy-name oikos-recall-s3-access \
   --policy-document file:///tmp/s3-policy.json
 
 # Get role ARN
@@ -70,6 +76,6 @@ echo "Role created: ${ROLE_ARN}"
 echo ""
 echo "Next step: attach this role to the Lambda function:"
 echo "aws lambda update-function-configuration \\"
-echo "  --function-name oikos-ledger-ingestion \\"
+echo "  --function-name oikos-recall-ingestion \\"
 echo "  --role ${ROLE_ARN} \\"
 echo "  --region ${REGION}"

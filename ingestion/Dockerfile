@@ -11,6 +11,9 @@ RUN microdnf install -y \
 # Copy requirements file
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 
+# Copy Cockroachdb's root cert
+COPY certs/root.crt ${LAMBDA_TASK_ROOT}/certs/root.crt
+
 # Install Python dependencies
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 

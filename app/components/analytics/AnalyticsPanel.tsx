@@ -4,14 +4,16 @@ import { useState, useEffect, useCallback } from "react"
 import { useAccounts } from "@/components/accounts/AccountsContext"
 import { InsightsChart } from "@/components/insights/InsightsChart"
 import { useTransactionCategories } from "@/lib/hooks/useTransactionCategories"
+import { ComparePanel } from "./ComparePanel"
 
-type Dimension = "merchants" | "payment_methods" | "subcategories" | "debit_credit"
+type Dimension = "merchants" | "payment_methods" | "subcategories" | "debit_credit" | "compare"
 
 const TABS: { id: Dimension; label: string }[] = [
   { id: "merchants", label: "Merchants" },
   { id: "payment_methods", label: "Payment Methods" },
   { id: "subcategories", label: "Subcategories" },
   { id: "debit_credit", label: "Debit vs Credit" },
+  { id: "compare", label: "Compare Accounts" },
 ]
 
 const MONTHS_OPTIONS = [
@@ -90,7 +92,7 @@ export function AnalyticsPanel() {
   const [error, setError] = useState<string | null>(null)
 
   const fetchData = useCallback(async (force = false) => {
-    if (!selectedAccountId) return
+    if (!selectedAccountId || activeTab === "compare") return
 
     const cacheKey = `oikos_analytics_cache_${selectedAccountId}_${activeTab}_${filters.months}_${filters.category}_${filters.transaction_type}`
 
@@ -174,20 +176,22 @@ export function AnalyticsPanel() {
             Multi-dimensional spending breakdown
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <select
-            value={selectedAccountId ?? ""}
-            onChange={(e) => setSelectedAccountId(e.target.value)}
-            className="rounded-md border border-input bg-background px-3 py-1.5 text-sm
-              focus:outline-none focus:ring-1 focus:ring-ring"
-          >
-            {accounts.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.bank_name} · {a.account_nickname ?? a.account_type}
-              </option>
-            ))}
-          </select>
-        </div>
+        {activeTab !== "compare" && (
+          <div className="flex items-center gap-2">
+            <select
+              value={selectedAccountId ?? ""}
+              onChange={(e) => setSelectedAccountId(e.target.value)}
+              className="rounded-md border border-input bg-background px-3 py-1.5 text-sm
+                focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.bank_name} · {a.account_nickname ?? a.account_type}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {/* Tabs */}
@@ -213,63 +217,67 @@ export function AnalyticsPanel() {
       </div>
 
       {/* Filters */}
-      <div className="flex items-center gap-3 border-b px-6 py-3 shrink-0">
-        <select
-          value={filters.months}
-          onChange={(e) => setFilters(prev => ({
-            ...prev, months: Number(e.target.value)
-          }))}
-          className="rounded-md border border-input bg-background px-3 py-1.5 text-xs
-            focus:outline-none focus:ring-1 focus:ring-ring"
-        >
-          {MONTHS_OPTIONS.map(o => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
-        </select>
-
-        {showTypeFilter && (
+      {activeTab !== "compare" && (
+        <div className="flex items-center gap-3 border-b px-6 py-3 shrink-0">
           <select
-            value={filters.transaction_type}
+            value={filters.months}
             onChange={(e) => setFilters(prev => ({
-              ...prev, transaction_type: e.target.value
+              ...prev, months: Number(e.target.value)
             }))}
             className="rounded-md border border-input bg-background px-3 py-1.5 text-xs
               focus:outline-none focus:ring-1 focus:ring-ring"
           >
-            <option value="debit">Debits</option>
-            <option value="credit">Credits</option>
-            <option value="all">All</option>
-          </select>
-        )}
-
-        {showCategoryFilter && (
-          <select
-            value={filters.category}
-            onChange={(e) => setFilters(prev => ({
-              ...prev, category: e.target.value
-            }))}
-            className="rounded-md border border-input bg-background px-3 py-1.5 text-xs
-              focus:outline-none focus:ring-1 focus:ring-ring"
-          >
-            <option value="">All categories</option>
-            {categories.map((c) => (
-              <option key={c} value={c}>{c}</option>
+            {MONTHS_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
-        )}
 
-        <button
-          onClick={() => fetchData(true)}
-          className="ml-auto text-xs text-muted-foreground hover:text-foreground
-            underline underline-offset-2"
-        >
-          Refresh
-        </button>
-      </div>
+          {showTypeFilter && (
+            <select
+              value={filters.transaction_type}
+              onChange={(e) => setFilters(prev => ({
+                ...prev, transaction_type: e.target.value
+              }))}
+              className="rounded-md border border-input bg-background px-3 py-1.5 text-xs
+                focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              <option value="debit">Debits</option>
+              <option value="credit">Credits</option>
+              <option value="all">All</option>
+            </select>
+          )}
+
+          {showCategoryFilter && (
+            <select
+              value={filters.category}
+              onChange={(e) => setFilters(prev => ({
+                ...prev, category: e.target.value
+              }))}
+              className="rounded-md border border-input bg-background px-3 py-1.5 text-xs
+                focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              <option value="">All categories</option>
+              {categories.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          )}
+
+          <button
+            onClick={() => fetchData(true)}
+            className="ml-auto text-xs text-muted-foreground hover:text-foreground
+              underline underline-offset-2"
+          >
+            Refresh
+          </button>
+        </div>
+      )}
 
       {/* Chart */}
       <div className="flex-1 overflow-y-auto p-6">
-        {isLoading ? (
+        {activeTab === "compare" ? (
+          <ComparePanel accounts={accounts} />
+        ) : isLoading ? (
           <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
             Loading...
           </div>

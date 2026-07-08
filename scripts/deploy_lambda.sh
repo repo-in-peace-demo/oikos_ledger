@@ -9,9 +9,10 @@ set -e
 source .env.local
 
 REGION=${AWS_REGION:-ap-south-1}
-FUNCTION_NAME=${AWS_LAMBDA_FUNCTION_NAME:-oikos-ledger-ingestion}
+AWS_PROFILE=${AWS_PROFILE:-}
+FUNCTION_NAME=${AWS_LAMBDA_FUNCTION_NAME:-oikos-recall-ingestion}
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REPO="oikos-ledger-ingestion"
+ECR_REPO="oikos-recall-ingestion"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
 
 echo "Deploying to Lambda: ${FUNCTION_NAME} in ${REGION}"
@@ -53,14 +54,29 @@ docker tag ${ECR_REPO}:latest ${ECR_URI}:latest
 echo "Pushing image to ECR..."
 docker push ${ECR_URI}:latest
 
-# Step 6: Update Lambda function to use new image
-echo "Updating Lambda function code..."
-aws lambda update-function-code \
-  --function-name ${FUNCTION_NAME} \
-  --image-uri ${ECR_URI}:latest \
-  --region ${REGION} \
-  --output text \
-  --query 'FunctionName'
+# Step 6: Create function if it doesn't exist, otherwise update its code
+if aws lambda get-function --function-name ${FUNCTION_NAME} --region ${REGION} >/dev/null 2>&1; then
+  echo "Function exists — updating code..."
+  aws lambda update-function-code \
+    --function-name ${FUNCTION_NAME} \
+    --image-uri ${ECR_URI}:latest \
+    --region ${REGION} \
+    --output text \
+    --query 'FunctionName'
+else
+  echo "Function does not exist — creating it..."
+  ROLE_ARN=$(aws iam get-role --role-name ${ROLE_NAME} --query Role.Arn --output text)
+  aws lambda create-function \
+    --function-name ${FUNCTION_NAME} \
+    --package-type Image \
+    --code ImageUri=${ECR_URI}:latest \
+    --role ${ROLE_ARN} \
+    --timeout 300 \
+    --memory-size 512 \
+    --region ${REGION} \
+    --output text \
+    --query 'FunctionName'
+fi
 
 # Step 7: Wait for code update to complete
 echo "Waiting for Lambda code update..."

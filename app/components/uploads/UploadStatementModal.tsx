@@ -426,7 +426,7 @@ export function UploadStatementModal({ accountId: accountIdProp, bankName, onSuc
           {/* Error — message, Cancel + Try again */}
           {state.phase === "error" && (
             <div className="space-y-3">
-              <p className="text-sm text-destructive">{state.message}</p>
+              <p className="break-words text-sm text-destructive">{state.message}</p>
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={handleCancel}>
                   Cancel

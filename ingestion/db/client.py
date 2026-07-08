@@ -22,9 +22,15 @@ _engine: Engine | None = None
 
 
 def _get_engine() -> Engine:
+    import os
     global _engine
     if _engine is None:
-        _engine = create_engine(_config.settings.database_url)
+        if os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+            cert_path = f'{os.getenv("LAMBDA_TASK_ROOT")}/certs/root.crt'
+            database_url = f"{_config.settings.database_url}&sslrootcert={cert_path}"
+            _engine = create_engine(database_url)
+        else:
+            _engine = create_engine(_config.settings.database_url)
     return _engine
 
 
