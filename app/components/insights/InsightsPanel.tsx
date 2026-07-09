@@ -23,6 +23,7 @@ export interface ChatTurn {
   type?: "message" | "suggestions"
   suggestions?: { query_text: string; query_hash: string }[]
   cached?: boolean
+  used_memory?: boolean
   sql?: string
   chart_type?: string
   results?: Record<string, unknown>[]
@@ -36,6 +37,7 @@ interface InsightResult {
   type?: "message" | "suggestions"
   suggestions?: { query_text: string; query_hash: string }[]
   cached?: boolean
+  used_memory?: boolean
   question: string
   intent: string
   intent_label: string
@@ -88,6 +90,14 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
   const isResponseInProgress = useRef(false)
   const processedCallIds = useRef<Set<string>>(new Set())
   const lastTranscriptRef = useRef<string>("")
+  // Voice's spoken-response text arrives as a *separate* Realtime API event
+  // (response.output_item.done) from the query_database tool result handleQuery resolves — this
+  // carries used_memory from that tool result across to the text turn built from that later event,
+  // since by then handleQuery's own return value (just a summary string, per the voice-safety
+  // addendum) is no longer available. Cleared immediately after being consumed by the next
+  // final_answer turn, so a later unrelated conversational reply (farewell, small talk) never
+  // inherits a stale value from an earlier query.
+  const lastUsedMemoryRef = useRef<boolean | undefined>(undefined)
   const shouldDisconnectAfterResponse = useRef(false)
   const awaitingFarewellResponse = useRef(false)
   const transcriptTimer = useRef<NodeJS.Timeout | null>(null)
@@ -313,6 +323,7 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
       if (!res.ok) {
         const data = await res.json()
         setError(data.error ?? "Query failed")
+        if (isVoice) lastUsedMemoryRef.current = undefined
         return ""
       }
 
@@ -325,6 +336,11 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
         if (data.intent === "off_topic") {
           if (!isVoice) {
               addTurn({ role: "assistant", content: data.response, type: "message" })
+            } else {
+              // Doesn't carry memory grounding — clear any stale value from an earlier query so
+              // the next voice text turn (built separately, from response.output_item.done)
+              // doesn't inherit it.
+              lastUsedMemoryRef.current = undefined
             }
           // Don't add canned message — let voice model handle conversation naturally
           return data.response ?? ""
@@ -338,6 +354,8 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
               type: "suggestions",
               suggestions: data.suggestions,
             })
+          } else {
+            lastUsedMemoryRef.current = undefined
           }
           return data.response ?? ""
         }
@@ -353,6 +371,7 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
               content: "",
               type: "message",
               cached: data.cached,
+              used_memory: data.used_memory,
               sql: data.sql,
               chart_type: data.chart_type,
               results: data.results,
@@ -361,6 +380,10 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
               row_count: data.row_count,
             })
         }
+        // Carried across to the text turn built later from response.output_item.done — see
+        // lastUsedMemoryRef's declaration for why this can't just be read off this response
+        // object directly at that point.
+        lastUsedMemoryRef.current = data.used_memory
         return data.response ?? ""
       }
 
@@ -369,6 +392,7 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
           content: data.response,
           type: "message",
           cached: data.cached,
+          used_memory: data.used_memory,
           sql: data.sql,
           chart_type: data.chart_type,
           results: data.results,
@@ -432,8 +456,12 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
                     intent_label: parsed.intent_label,
                     intent_description: parsed.intent_description,
                     row_count: parsed.row_count,
+                    used_memory: parsed.used_memory,
                   },
                 ])
+                // Carried across to the text turn built later from response.output_item.done —
+                // see lastUsedMemoryRef's declaration for why.
+                lastUsedMemoryRef.current = parsed.used_memory
               } else {
                 updateTurn(turnId, {
                   sql: parsed.sql,
@@ -442,6 +470,7 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
                   intent_label: parsed.intent_label,
                   intent_description: parsed.intent_description,
                   row_count: parsed.row_count,
+                  used_memory: parsed.used_memory,
                 })
               }
             } else if (parsed.type === "text") {
@@ -496,6 +525,7 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
         content: data.response,
         type: "message",
         cached: data.cached,
+        used_memory: data.used_memory,
         sql: data.sql,
         chart_type: data.chart_type,
         results: data.results,
@@ -893,8 +923,12 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
             addTurn({
               role: "assistant",
               content: textContent,
-              type: "message"
+              type: "message",
+              used_memory: lastUsedMemoryRef.current,
             })
+            // Consume once — an unrelated conversational turn after this (farewell, small talk)
+            // shouldn't inherit this query's memory-grounding signal.
+            lastUsedMemoryRef.current = undefined
           }
         }
 

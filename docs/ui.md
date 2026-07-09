@@ -125,6 +125,7 @@ Four-tab breakdown of spending across different dimensions. All data comes from 
 - **Table card** — open by default, collapsible
 - **SQL card** — collapsed by default, expandable with copy button
 - **Cached badge** — `⚡ cached` appears inside bubble when `cached: true`
+- **From-memory badge** — `🧠 from memory` appears inside bubble when `used_memory: true` (a semantic_facts match cleared the similarity threshold and was used); voice mode never shows this badge since the bubble itself is suppressed there, but the model is separately instructed to phrase such references naturally (e.g. "I've noticed that...") via the system prompt
 - **Suggestions** — clickable buttons that trigger cached query lookup
 
 ### InsightsChart

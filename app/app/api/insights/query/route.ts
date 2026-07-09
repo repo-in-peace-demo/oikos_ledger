@@ -2,6 +2,7 @@ import { auth } from "@/auth"
 import { db, dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import OpenAI from "openai"
+import { mcpSelectQuery } from "@/lib/mcp/client"
 
 export const dynamic = "force-dynamic"
 
@@ -9,6 +10,43 @@ const openai = new OpenAI({
   baseURL: process.env.OPENAI_BASE_URL,
   apiKey: process.env.OPENAI_API_KEY,
 })
+
+// Semantic similarity search on semantic_facts — grounds the agent's response with confirmed
+// patterns Oikos Recall has learned about this user, in addition to the pre-built query_cache
+// similarity search above (a separate table, separate purpose).
+//
+// This threshold was originally set to 0.85 to match query_cache's Tier-2 convention, but that
+// convention doesn't transfer here: query_cache matches question-vs-question (near-paraphrases of
+// a previous prompt), while this matches question-vs-declarative-fact ("has my balance been
+// changing lately?" vs. "Combined balance has stayed roughly flat around ₹749,764..."). Empirically
+// (text-embedding-3-small, checked directly against a live confirmed fact), on-topic question/fact
+// pairs score ~0.46-0.52 cosine similarity, while clearly unrelated questions score ~0.20-0.25 — a
+// 0.85 threshold made the search fire on nothing. 0.35 sits between the two clusters, with margin
+// on both sides. Based on a single fact and a handful of phrasings — revisit once more confirmed
+// facts and real queries exist to widen the sample.
+const FACT_SIMILARITY_THRESHOLD = 0.35
+const FACT_SIMILARITY_LIMIT = 3
+
+// Facts freshness marker check — a direct-SQL (not MCP) read of MAX(updated_at) across this
+// user+account's confirmed, non-superseded facts. Cheap indexed aggregate, not the expensive
+// operation, so it gets its own short budget. A failure or timeout here is treated as "unknown"
+// (never blocks) — it just forces the slower cache-miss path below rather than risking a stale hit.
+const FACT_MARKER_TIMEOUT_MS = 300
+
+// Two budgets, not one, because the two outcomes below have very different real cost:
+//   - Cache HIT (marker unchanged since last fetch): only the embedding call runs, no MCP at all.
+//     Measured 479-887ms for the embedding call alone across 5 live end-to-end runs (one outlier
+//     at 2423ms on a cold first call) — 900ms left only ~13ms of margin over the 887ms sample, too
+//     tight given that's real observed variance, not a hypothetical; 1200ms leaves real headroom.
+//   - Cache MISS (first request for this user+account, or facts changed since): still needs the
+//     full embedding + MCP round trip. Measured MCP round trip alone at 718-6246ms (the high end
+//     specifically the first select_query call after a connection is opened — a real, recurring
+//     cost on a serverless platform where instances cycle) — 3500ms leaves margin over the
+//     steady-state end of that range, though the most extreme cold-start case can still exceed it.
+// Voice is latency-sensitive (challenges.md); a miss taking multiple seconds is exactly why caching
+// this was worth doing — most turns should now land on the fast (1200ms) path, not the slow one.
+const FACT_HIT_TIMEOUT_MS = 1200
+const FACT_MISS_TIMEOUT_MS = 3500
 
 const BLOCKED_KEYWORDS = [
   "drop", "delete", "update", "insert", "truncate",
@@ -136,6 +174,45 @@ function dedupeConsecutive(history: HistoryEntry[]): HistoryEntry[] {
   return deduped
 }
 
+// The literal final user message is often a fragment on its own ("savings for the last seven
+// days" after a clarifying question doesn't mention "balance" at all) — the topic was established
+// in an earlier turn. Folds in the preceding user turns so the semantic_facts similarity search
+// (below) sees the same conversational context runAgentLoop already gets via conversation_history,
+// rather than judging the current turn in isolation. Deliberately user-turns-only (assistant
+// clarifying questions/summaries would dilute the embedding without adding topic signal).
+function buildContextualQueryText(question: string, history: HistoryEntry[]): string {
+  const recentUserTurns = history
+    .filter((h) => h.role === "user")
+    .slice(-2)
+    .map((h) => h.content)
+  return [...recentUserTurns, question].join(" ")
+}
+
+// The categories table is a small, stable global taxonomy (not per-user data, rarely changes) —
+// cached indefinitely for the life of a warm instance rather than behind a freshness marker like
+// semantic_facts. Names are cached lowercased since every call site only ever compares against a
+// lowercased question. A failed lookup degrades to an empty list (no category-aware bypass, not a
+// hard failure) — the pre-existing keyword classifier below still runs either way.
+let categoryNamesCache: string[] | null = null
+
+async function getCategoryNames(): Promise<string[]> {
+  if (categoryNamesCache) return categoryNamesCache
+  try {
+    const result = (await dbReadonly.execute(
+      sql.raw(`SELECT name FROM categories`),
+    )) as unknown as { rows: { name: string }[] }
+    categoryNamesCache = result.rows.map((row) => row.name.toLowerCase())
+    return categoryNamesCache
+  } catch (err) {
+    console.error(
+      "Failed to load category names for intent classification — category-aware "
+      + "pre-built-intent bypass degraded to off, keyword classifier still runs:",
+      err,
+    )
+    return []
+  }
+}
+
 async function hashQuery(text: string): Promise<string> {
   const normalized = text
     .toLowerCase()
@@ -160,6 +237,296 @@ async function generateEmbedding(text: string): Promise<number[]> {
     user: "oikos-ledger",
   })
   return response.data[0].embedding
+}
+
+// The MCP select_query tool returns a VECTOR column as its pgvector text form ("[0.1,-0.2,...]"),
+// not a JSON array — parse defensively in case a future MCP server version returns it pre-parsed.
+function parseVectorColumn(raw: unknown): number[] {
+  if (Array.isArray(raw)) return raw.map(Number)
+  if (typeof raw === "string") {
+    return raw.replace(/^\[|\]$/g, "").split(",").map(Number)
+  }
+  throw new Error(`Unexpected embedding column format: ${typeof raw}`)
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0
+  let normA = 0
+  let normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+type FactCandidate = { description: string; embedding: number[] }
+type FactCacheEntry = { marker: string | null; candidates: FactCandidate[] }
+
+// Caches the candidate-fact fetch (not the final relevantFacts — those depend on each request's
+// own question embedding, which always changes) keyed by "userId:accountId". Module-scope, so it
+// survives only within one warm serverless instance's lifetime (Vercel/Lambda model) — reset on a
+// cold start, and not shared across concurrent instances. This is a fast-path optimization, not a
+// persistence layer: correctness never depends on an entry surviving, since a miss always falls
+// through to a real MCP fetch below.
+const factCandidatesCache = new Map<string, FactCacheEntry>()
+
+function factCacheKey(userId: string, accountId: string): string {
+  return `${userId}:${accountId}`
+}
+
+// The cheap freshness signal that drives cache invalidation: MAX(updated_at) across this
+// user+account's confirmed, non-superseded facts. Whenever distillation writes a new confirmed
+// fact (or promotes one from tentative), this value changes, which is exactly the "version" we
+// need — no separate marker table required. Superseded rows are excluded so an old row being
+// marked superseded_by doesn't matter once it's no longer a candidate anyway.
+//
+// Deliberately direct SQL (dbReadonly), not MCP — this is the one exception to "reads for this
+// feature go through MCP." The facts' actual content still only ever comes back via MCP below;
+// this marker never returns description/embedding data, only a timestamp.
+async function getFactsFreshnessMarker(userId: string, accountId: string): Promise<string | null> {
+  const result = (await dbReadonly.execute(sql.raw(`
+    SELECT MAX(updated_at) AS marker
+    FROM semantic_facts
+    WHERE user_id = '${userId}'
+      AND (account_id IS NULL OR account_id = '${accountId}')
+      AND confidence_status = 'confirmed'
+      AND superseded_by IS NULL
+  `))) as unknown as { rows: Record<string, unknown>[] }
+  const marker = result.rows[0]?.marker
+  return marker ? String(marker) : null
+}
+
+// Wraps the marker check in its own short timeout. A failure or timeout here is deliberately
+// collapsed to a single "unknown" outcome (not distinguished like the embedding/MCP path below) —
+// either way the only consequence is forcing the slower-but-always-correct cache-miss path, so
+// there's nothing further to act on by telling them apart.
+async function getFactsFreshnessMarkerOrUnknown(
+  userId: string,
+  accountId: string,
+): Promise<string | null | "unknown"> {
+  const work = getFactsFreshnessMarker(userId, accountId)
+  work.catch(() => {})
+
+  let timedOut = false
+  const timeout = new Promise<"timeout">((resolve) => {
+    setTimeout(() => {
+      timedOut = true
+      resolve("timeout")
+    }, FACT_MARKER_TIMEOUT_MS)
+  })
+
+  try {
+    const result = await Promise.race([work, timeout])
+    if (timedOut) {
+      console.error(
+        `Facts freshness marker check exceeded ${FACT_MARKER_TIMEOUT_MS}ms — `
+        + `treating as unknown (forces a fresh MCP fetch)`,
+      )
+      return "unknown"
+    }
+    return result as string | null
+  } catch (err) {
+    console.error(
+      "Facts freshness marker check failed — treating as unknown (forces a fresh MCP fetch):",
+      err,
+    )
+    return "unknown"
+  }
+}
+
+// Confirmed semantic_facts whose embedding is similar to the question, for grounding the agent's
+// response — read-only (mcpSelectQuery only ever calls select_query), scoped to this user and
+// either user-level facts (account_id IS NULL) or facts for this specific account, so a fact from
+// a different account never leaks into this account's context.
+//
+// Similarity is computed in application code (cosineSimilarity), not in SQL via pgvector's <=>
+// operator — the MCP select_query tool caps query text at 16384 characters, and a 1536-dimension
+// embedding literal is ~29,000 characters on its own; inlining it into the query text (as an
+// earlier version of this function did, once in WHERE and once in ORDER BY — ~59,000 characters
+// total) failed on every single call with "query exceeds maximum length", not a timeout. The
+// candidate query carries no vector at all — only the filtered facts' `embedding` column comes
+// back as query *results*, which aren't subject to the same query-text cap. LIMIT 50 bounds the
+// candidate set at a level no real user's confirmed-fact count should approach.
+//
+// The candidate fetch itself is cached (see factCandidatesCache) behind the freshness marker
+// above, so MCP is only actually hit on a genuine cache miss — expected to be roughly once per
+// distillation run per active user+account, not once per turn. This is why there are two timeout
+// budgets below rather than one: a hit only pays for the embedding call, a miss still pays for the
+// full embedding + MCP round trip.
+//
+// Takes contextual query text (see buildContextualQueryText), not a precomputed embedding — the
+// query_cache Tier-2 embedding is deliberately not reused here. That embedding is of the literal
+// current-turn question only (correct for its own purpose — matching this exact question against
+// past exact questions), but a bare follow-up like "savings for the last seven days" carries no
+// topical signal on its own when the topic was established in an earlier turn. This does mean a
+// second embeddings call rather than reusing one — unavoidable, since the question embedding
+// always changes per turn even when the candidate facts don't.
+//
+// Hard-timeout + degrade, same pattern as /api/macro's "MCP memory lookup failed, degrading to
+// indicators-only": if this doesn't complete within budget, or either call fails outright, proceed
+// with no facts — never a hard failure, and never adds unbounded latency to a pipeline shared with
+// the (latency-sensitive) voice advisor. Timeout and hard-error are logged distinctly (with
+// elapsed time, and — for a hard error — which of the two calls threw and the actual error) so a
+// stuck MCP connection doesn't read the same as an OpenAI auth failure.
+async function getRelevantFactDescriptions(
+  userId: string,
+  accountId: string,
+  contextualQueryText: string,
+): Promise<string[]> {
+  const startedAt = Date.now()
+  const cacheKey = factCacheKey(userId, accountId)
+
+  const marker = await getFactsFreshnessMarkerOrUnknown(userId, accountId)
+  const markerMs = Date.now() - startedAt
+
+  const cached = factCandidatesCache.get(cacheKey)
+  const isHit = marker !== "unknown" && cached !== undefined && cached.marker === marker
+  const timeoutBudget = isHit ? FACT_HIT_TIMEOUT_MS : FACT_MISS_TIMEOUT_MS
+
+  let step: "embedding" | "mcp_query" = "embedding"
+  // Populated as each step finishes, so the split is known even if the *other* step is the one
+  // that eventually times out or throws — e.g. a timeout stuck in "mcp_query" still reports how
+  // long the embedding call took before it got there. mcpMs stays null entirely on a cache hit,
+  // since that step is skipped, not merely fast.
+  let embeddingMs: number | null = null
+  let mcpMs: number | null = null
+
+  const work = (async () => {
+    const embeddingStartedAt = Date.now()
+    const questionEmbedding = await generateEmbedding(contextualQueryText)
+    embeddingMs = Date.now() - embeddingStartedAt
+
+    let candidates: FactCandidate[]
+    if (isHit && cached) {
+      candidates = cached.candidates
+    } else {
+      step = "mcp_query"
+      const mcpStartedAt = Date.now()
+      const rows = await mcpSelectQuery<{ description: string; embedding: unknown }>(`
+        SELECT description, embedding
+        FROM semantic_facts
+        WHERE user_id = '${userId}'
+          AND (account_id IS NULL OR account_id = '${accountId}')
+          AND confidence_status = 'confirmed'
+          AND superseded_by IS NULL
+        LIMIT 50
+      `)
+      mcpMs = Date.now() - mcpStartedAt
+      candidates = rows.map((row) => ({
+        description: row.description,
+        embedding: parseVectorColumn(row.embedding),
+      }))
+      // Only cache against a known marker — caching against "unknown" would let a later request
+      // treat an unverifiable version as if it were confirmed current.
+      if (marker !== "unknown") {
+        factCandidatesCache.set(cacheKey, { marker, candidates })
+      }
+    }
+
+    // Returns ALL scored candidates, unfiltered — filtering/sorting/slicing happens in the outer
+    // scope below, only once we know this result actually won the race against the timeout (see
+    // the bug this fixes, in logSimilarityOutcome's comment).
+    return candidates.map((c) => ({
+      description: c.description,
+      similarity: cosineSimilarity(questionEmbedding, c.embedding),
+    }))
+  })()
+
+  // Logs whether a match cleared FACT_SIMILARITY_THRESHOLD, and its score — or that nothing did.
+  //
+  // Deliberately called from the outer scope, after Promise.race settles, NOT from inside `work`
+  // itself. An earlier version logged from inside `work`, unconditionally, as soon as scoring
+  // finished — which fires regardless of whether `work` won the race below. If `work` resolves
+  // slightly after `timedOut` already became true, that earlier version would log a genuine
+  // "MATCH" for a result that was simultaneously being discarded by the `if (timedOut) return []`
+  // branch — producing exactly the confirmed bug: server logs showing a real match, while the
+  // metadata sent to the client (built from the discarded `[]`) carried used_memory: false. Calling
+  // this only on the branch that actually reaches the caller keeps the log truthful to what the
+  // response actually contained.
+  function logSimilarityOutcome(
+    scoredAll: { description: string; similarity: number }[],
+    outcome: "used" | "arrived after timeout — NOT used, response already sent",
+  ) {
+    const bestMatch = scoredAll.length > 0
+      ? scoredAll.reduce((best, c) => (c.similarity > best.similarity ? c : best))
+      : null
+    if (bestMatch && bestMatch.similarity > FACT_SIMILARITY_THRESHOLD) {
+      console.log(
+        `Semantic facts similarity search: MATCH (${outcome}) — best score `
+        + `${bestMatch.similarity.toFixed(4)} cleared threshold ${FACT_SIMILARITY_THRESHOLD} `
+        + `(${scoredAll.length} candidate(s) checked). Top match: "${bestMatch.description.slice(0, 100)}"`,
+      )
+    } else if (bestMatch) {
+      console.log(
+        `Semantic facts similarity search: NO MATCH (${outcome}) — best score `
+        + `${bestMatch.similarity.toFixed(4)} did not clear threshold ${FACT_SIMILARITY_THRESHOLD} `
+        + `(${scoredAll.length} candidate(s) checked).`,
+      )
+    } else {
+      console.log(
+        `Semantic facts similarity search: NO MATCH (${outcome}) — no confirmed candidate facts `
+        + `found for this user/account.`,
+      )
+    }
+  }
+
+  let timedOut = false
+  const timeout = new Promise<"timeout">((resolve) => {
+    setTimeout(() => {
+      timedOut = true
+      resolve("timeout")
+    }, timeoutBudget)
+  })
+
+  // If the timeout branch wins the race below, `work` is still running — this still logs its
+  // eventual outcome (clearly marked as arrived-too-late-to-use) once it settles, for diagnosing
+  // exactly this kind of near-miss, but never affects what's already been returned to the caller.
+  work.then(
+    (scoredAll) => {
+      if (timedOut) logSimilarityOutcome(scoredAll, "arrived after timeout — NOT used, response already sent")
+    },
+    () => {},
+  )
+
+  try {
+    const result = await Promise.race([work, timeout])
+    if (timedOut) {
+      console.error(
+        `Semantic facts similarity search TIMED OUT after ${Date.now() - startedAt}ms `
+        + `(budget ${timeoutBudget}ms, ${isHit ? "cache hit" : "cache miss"} path) — `
+        + `still in "${step}" when the budget ran out. marker check: ${markerMs}ms, `
+        + `embedding: ${embeddingMs ?? "did not finish"}ms, `
+        + `mcp_query: ${mcpMs ?? (isHit ? "skipped (cache hit)" : "did not finish")}ms `
+        + `— degrading to no memory context`,
+      )
+      return []
+    }
+    const scoredAll = result as { description: string; similarity: number }[]
+    logSimilarityOutcome(scoredAll, "used")
+    console.log(
+      `Semantic facts similarity search completed in ${Date.now() - startedAt}ms `
+      + `(${isHit ? "cache hit" : "cache miss"}; marker check: ${markerMs}ms, `
+      + `embedding: ${embeddingMs}ms, mcp_query: ${mcpMs ?? "skipped (cache hit)"}ms, `
+      + `budget ${timeoutBudget}ms)`,
+    )
+    return scoredAll
+      .filter((c) => c.similarity > FACT_SIMILARITY_THRESHOLD)
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, FACT_SIMILARITY_LIMIT)
+      .map((row) => row.description)
+  } catch (err) {
+    console.error(
+      `Semantic facts similarity search FAILED during "${step}" after ${Date.now() - startedAt}ms `
+      + `(${isHit ? "cache hit" : "cache miss"} path; marker check: ${markerMs}ms, `
+      + `embedding: ${embeddingMs ?? "did not finish"}ms, `
+      + `mcp_query: ${mcpMs ?? (isHit ? "skipped (cache hit)" : "did not finish")}ms) `
+      + `— degrading to no memory context. Error:`,
+      err,
+    )
+    return []
+  }
 }
 
 async function getExactCacheHit(
@@ -294,9 +661,16 @@ const AGENT_SYSTEM_PROMPT = (
   accountId: string,
   currency: string,
   dateContext: string,
+  relevantFacts: string[],
 ) => {
   const today = new Date().toISOString().split("T")[0]
   const currentYear = today.slice(0, 4)
+  // Grounding context only — never a forced reference. If nothing cleared the similarity
+  // threshold (the common case until distillation has produced confirmed facts), this is empty
+  // and the prompt reads exactly as it did before this context existed.
+  const memoryContext = relevantFacts.length > 0
+    ? `\nPatterns Oikos Recall has confirmed about this user — reference naturally if relevant to the question, don't force it in. When you do reference one, phrase it as a pattern you've noticed over time (e.g. "I've noticed that...", "Based on what I've seen before...") rather than stating it as a flat fact just read from today's data:\n${relevantFacts.map((f) => `- ${f}`).join("\n")}\n`
+    : ""
   return `You are a personal finance assistant for an app called Oikos Ledger. You have access to the user's transaction data via the run_sql tool.
 
 Today's date is ${today}. The current year is ${currentYear}.
@@ -305,7 +679,7 @@ When the user refers to a month by name only (e.g. "March",
 year is explicitly stated by the user.
 
 ${dateContext ? `Active date filter: ${dateContext}` : ""}
-
+${memoryContext}
 Database table: transactions
 Columns:
   - transaction_date (date)
@@ -338,6 +712,18 @@ SQL Rules (always enforced):
   - Example: "last 3 months" →
     transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
     AND transaction_date <= CURRENT_DATE
+  - "Last N days" is an inclusive range that includes today — today counts as
+    one of the N days. The correct lower bound is
+    CURRENT_DATE - INTERVAL '(N-1) days', NOT CURRENT_DATE - INTERVAL 'N days'
+    (that spans N+1 calendar dates, an off-by-one).
+  - CORRECT — "last 7 days" as of today (${today}):
+    transaction_date >= CURRENT_DATE - INTERVAL '6 days'
+    AND transaction_date <= CURRENT_DATE
+    This spans exactly 7 calendar dates: ${today} and the 6 days before it.
+  - WRONG — transaction_date >= CURRENT_DATE - INTERVAL '7 days' as the lower
+    bound for "last 7 days": this spans 8 calendar dates, one too many.
+  - The same (N-1) adjustment applies to any "last N days" phrasing —
+    e.g. "last 30 days" → lower bound CURRENT_DATE - INTERVAL '29 days'.
   - DO NOT include 'currency' in SELECT unless explicitly asked
   - Use ILIKE '%value%' for merchant/category text matching
   - Do NOT expand category words into sub-arrays
@@ -358,6 +744,25 @@ SQL Rules (always enforced):
   If the user asks about payment method, explain that this
   information is not available in the transaction data, and
   offer to break down by merchant or category instead.
+- Questions about "balance" (e.g. "what's my balance", "has my
+  balance been changing", "is my balance stable") are NOT the
+  same as questions about spending or cash flow. Balance
+  questions must query the closing_balance column directly —
+  it is the actual bank-verified running balance, already
+  computed by the ingestion pipeline. NEVER approximate a
+  balance by summing credits and debits from zero
+  (e.g. SUM(CASE WHEN transaction_type = 'credit' THEN amount
+  ELSE -amount END)) — that is net cash flow over the query
+  window, not the real balance, and will not match the bank's
+  actual figures.
+  Example — "has my balance been changing lately?":
+    SELECT TO_CHAR(transaction_date, 'YYYY-MM-DD') AS day, closing_balance
+    FROM transactions
+    WHERE user_id = '${userId}' AND account_id = '${accountId}'
+      AND closing_balance IS NOT NULL
+    ORDER BY transaction_date ASC
+  Example — "what's my current balance?": same query, ORDER BY
+  transaction_date DESC LIMIT 1, chart_type "none".
 - The following questions should always be answered with run_sql:
   "credits vs debits", "credits versus debits", "income vs expenses" → 
   query debits and credits grouped by month
@@ -388,11 +793,12 @@ async function runAgentLoop(
   history: HistoryEntry[],
   dateContext: string,
   currency: string,
+  relevantFacts: string[],
 ): Promise<AgentResult> {
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     {
       role: "system",
-      content: AGENT_SYSTEM_PROMPT(userId, accountId, currency, dateContext),
+      content: AGENT_SYSTEM_PROMPT(userId, accountId, currency, dateContext, relevantFacts),
     },
     ...history.map(h => ({
       role: h.role as "user" | "assistant",
@@ -645,9 +1051,17 @@ export async function POST(request: Request) {
 
   // Natural language → pre-built intent mapping
   // Catches conversational variants that don't go through quick buttons
+  const categoryNames = await getCategoryNames()
   const resolvedIntent = intent ?? (() => {
     const q = (question ?? "").toLowerCase()
     if (!q) return null
+    // Category-specific questions must always fall through to the custom agent-loop path — no
+    // pre-built intent filters to a single named category (spending_by_category groups ALL
+    // categories, it doesn't filter to one). This check runs first and wins unconditionally,
+    // before any keyword check below gets a chance to fire: a question like "food expenses
+    // excluding any credits or refunds" would otherwise match the credits_vs_debits keyword check
+    // (plain substring matching has no concept of negation) and lose its category filter entirely.
+    if (categoryNames.some((name) => q.includes(name))) return null
     if (q.includes("credit") && (q.includes("debit") || q.includes("expense")))
       return "credits_vs_debits"
     if ((q.includes("monthly") || q.includes("month")) &&
@@ -824,6 +1238,9 @@ export async function POST(request: Request) {
               chart_type: chartType,
               row_count: rows.length,
               cached: false,
+              // Pre-built intent fast path never runs the agent loop, so it never checks
+              // semantic_facts — always false here, unlike the custom-query path below.
+              used_memory: false,
             }
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`)
@@ -888,6 +1305,7 @@ Summarize these results accurately.`,
               chart_type: chartType,
               row_count: rows.length,
               cached: false,
+              used_memory: false,
             }
             await writeCacheEntry(
               userId, account_id, queryHash,
@@ -928,6 +1346,16 @@ Summarize these results accurately.`,
   `))) as unknown as { rows: Record<string, unknown>[] }
   const currency = currencyResult.rows[0]?.currency as string ?? "INR"
 
+  // Builds contextual query text (recent user turns + current question) rather than reusing the
+  // `embedding` already computed above for query_cache — that embedding is of the literal current
+  // question only, which loses the topic when the current turn is a bare follow-up (e.g. "savings
+  // for the last seven days" after "how has my balance been lately"). Hard-timeout + degrade
+  // internally; never throws, never adds unbounded latency to a pipeline the voice advisor also
+  // depends on.
+  const relevantFacts = await getRelevantFactDescriptions(
+    userId, account_id, buildContextualQueryText(question ?? cacheText, dedupedHistory),
+  )
+
   let agentResult: AgentResult
   try {
     agentResult = await runAgentLoop(
@@ -937,6 +1365,7 @@ Summarize these results accurately.`,
       dedupedHistory,
       dateContext,
       currency,
+      relevantFacts,
     )
   } catch (error) {
     console.error("Agent loop failed:", error)
@@ -961,6 +1390,7 @@ Summarize these results accurately.`,
       chart_type: "none",
       row_count: 0,
       cached: false,
+      used_memory: relevantFacts.length > 0,
     })
   }
 
@@ -988,6 +1418,7 @@ Summarize these results accurately.`,
           chart_type: chartType,
           row_count: rows.length,
           cached: false,
+          used_memory: relevantFacts.length > 0,
         }
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`)
@@ -1020,6 +1451,7 @@ Summarize these results accurately.`,
           chart_type: chartType,
           row_count: rows.length,
           cached: false,
+          used_memory: relevantFacts.length > 0,
         }
         await writeCacheEntry(
           userId, account_id, queryHash,
