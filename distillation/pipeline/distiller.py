@@ -157,6 +157,7 @@ def upsert_or_supersede_fact(
     )
 
     if not materially_changed:
+        existing.confidence_status = confidence_status
         existing.occurrence_count = occurrence_count
         existing.last_accessed_at = now
         existing.relevance_score = min(1.0, existing.relevance_score + 0.05)
@@ -248,6 +249,22 @@ def _classify_balance_steps(snapshots: list[tuple[datetime, float]]) -> list[str
     return steps
 
 
+def _format_elapsed_duration(elapsed: timedelta) -> str:
+    """Phrase an elapsed timedelta for the trend description — measured from the run's first to
+    last snapshot, not a count of distinct calendar month labels. Counting labels conflates
+    "spans a month boundary" with "spans a month": two snapshots a day apart straddling midnight
+    on the 1st would count as 2 distinct "%Y-%m" labels and misreport as "about 2 months".
+    """
+    days = elapsed.total_seconds() / 86400
+    if days < 1:
+        return "less than a day"
+    if days < 60:
+        whole_days = max(1, round(days))
+        return f"{whole_days} day{'' if whole_days == 1 else 's'}"
+    months = round(days / 30)
+    return f"about {months} month{'' if months == 1 else 's'}"
+
+
 def describe_balance_trend(snapshots: list[tuple[datetime, float]]) -> tuple[str, int] | None:
     """Describe the trailing run of agreeing steps (flat/down/up) at the end of the snapshot
     history. A single reversal ends the run, so this never confirms a trend off one data point —
@@ -270,20 +287,20 @@ def describe_balance_trend(snapshots: list[tuple[datetime, float]]) -> tuple[str
     run_snapshots = snapshots[-occurrence_count:]
     latest_balance = run_snapshots[-1][1]
     first_balance = run_snapshots[0][1]
-    months_spanned = len({ts.strftime("%Y-%m") for ts, _ in run_snapshots})
-    month_word = f"{months_spanned} month{'' if months_spanned == 1 else 's'}"
+    elapsed = run_snapshots[-1][0] - run_snapshots[0][0]
+    duration_phrase = _format_elapsed_duration(elapsed)
 
     if direction == "flat":
         description = (
             f"Combined balance has stayed roughly flat around ₹{round(latest_balance):,} "
-            f"for about {month_word}."
+            f"for {duration_phrase}."
         )
     else:
         pct = abs((latest_balance - first_balance) / first_balance) * 100 if first_balance else 0.0
         verb = "declined" if direction == "down" else "increased"
         description = (
             f"Combined balance has {verb} about {pct:.0f}% (to ₹{round(latest_balance):,}) "
-            f"over about {month_word}."
+            f"over {duration_phrase}."
         )
 
     return description, occurrence_count

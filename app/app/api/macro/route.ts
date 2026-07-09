@@ -6,7 +6,10 @@ import { episodic_events } from "@/lib/db/schema"
 import { getLatestMacroIndicators } from "@/lib/db/queries/macro"
 import { getBankAccountsByUserId } from "@/lib/db/queries/bank_accounts"
 import { getLatestAccountBalance } from "@/lib/db/queries/transactions"
+import { getUserById } from "@/lib/db/queries/users"
 import { generateEmbedding } from "@/lib/embeddings"
+import { formatCurrency } from "@/lib/currency"
+import { DEFAULT_CURRENCY } from "@/lib/constants/currencies"
 import { mcpSelectQuery } from "@/lib/mcp/client"
 
 export const dynamic = "force-dynamic"
@@ -22,6 +25,13 @@ const BLEND_CAVEAT_MONTH_THRESHOLD = 3
 // blending entirely. Its own figure is still shown, just not summed in.
 const MAX_ACCOUNT_STALENESS_MONTHS = 6
 
+// Snapshot recording is separate from what text gets shown: every real page load should record
+// a balance snapshot (that's what gives the distillation job trend data), but rapid reloads in
+// the same sitting shouldn't each write their own row. Throttle to one snapshot per this window —
+// short enough that a genuine same-day check-in (e.g. right after uploading a new statement)
+// still gets recorded, long enough to collapse a burst of refreshes into one write.
+const SNAPSHOT_THROTTLE_HOURS = 1
+
 type MacroIndicatorRow = {
   indicator: string
   period: string
@@ -36,6 +46,8 @@ type SemanticFactRow = {
   description: string
   relevance_score: number
   confidence_status: string
+  occurrence_count: number
+  updated_at: string
 }
 
 type BlendState = "blended_clean" | "blended_with_caveat" | "not_blended"
@@ -69,6 +81,13 @@ const INDICATOR_LABELS: Record<string, string> = {
 // unmapped — see ingestion/sources/macro_fetch.py — so it's never "missing", just untracked).
 const CORE_INDICATORS = ["gdp_growth", "gdp_per_capita", "inflation", "repo_rate"] as const
 
+// Allow-list, not a block-list: only fact_types that belong on the Macro page's memory panel.
+// account_id-scoped facts (e.g. Compare's "category_baseline") are excluded by the account_id
+// IS NULL filter below regardless, but this allow-list also keeps out any future user-level
+// fact_type that isn't macro-relevant. Add new macro-relevant types here as they're built
+// (e.g. a future "trend:repo_rate_snapshot").
+const MACRO_RELEVANT_FACT_TYPES = ["trend:balance_snapshot"] as const
+
 function buildExplanationKey(indicators: MacroIndicatorRow[]): string {
   return indicators
     .map((i) => `${i.indicator}:${i.period}`)
@@ -76,8 +95,51 @@ function buildExplanationKey(indicators: MacroIndicatorRow[]): string {
     .join(",")
 }
 
-function formatRupees(value: number): string {
-  return `₹${Math.round(Math.abs(value)).toLocaleString("en-IN")}`
+// Same day/week/month bucketing convention as distillation/pipeline/distiller.py's
+// _format_elapsed_duration — day counts are exact, month counts are approximate (~30 days/month
+// via rounding), not a count of distinct calendar month labels.
+function formatDataAge(elapsedMs: number): string {
+  const days = elapsedMs / 86_400_000
+  if (days < 1) return "less than a day"
+  if (days < 60) {
+    const wholeDays = Math.max(1, Math.round(days))
+    return `${wholeDays} day${wholeDays === 1 ? "" : "s"}`
+  }
+  const months = Math.round(days / 30)
+  return `about ${months} month${months === 1 ? "" : "s"}`
+}
+
+// GDP per capita, unlike the repo rate, is not a value that genuinely holds constant between
+// updates — it almost certainly changed over the intervening period, we simply don't have a
+// newer published figure. So this reports honest data age ("N months old"), never "unchanged
+// since" — that phrasing would misrepresent a reporting gap as stability. Computed fresh from
+// today's date each request, not stored.
+function gdpPerCapitaAgeNote(indicators: MacroIndicatorRow[]): string | null {
+  const row = indicators.find((i) => i.indicator === "gdp_per_capita")
+  if (!row) return null
+  const periodStart = new Date(`${row.period}-01T00:00:00Z`) // period is "YYYY-MM"
+  if (Number.isNaN(periodStart.getTime())) return null
+  const age = formatDataAge(Date.now() - periodStart.getTime())
+  return `Most recent World Bank data, ${age} old (more recent figures not yet published).`
+}
+
+function formatPeriodLabel(period: string): string {
+  // period is "YYYY-MM" — render as "Dec 2025" without shifting the underlying stored value.
+  const date = new Date(`${period}-01T00:00:00Z`)
+  return date.toLocaleDateString("en-US", { month: "short", year: "numeric", timeZone: "UTC" })
+}
+
+// Unlike GDP per capita, the repo rate genuinely does hold constant between MPC decisions — so
+// "unchanged since" is the honest framing here, not a euphemism for a reporting gap. The stored
+// period (the real date of the last actual rate change) is kept visible as-is; only the elapsed
+// context alongside it is computed fresh from today's date each request, not stored.
+function repoRateUnchangedNote(indicators: MacroIndicatorRow[]): string | null {
+  const row = indicators.find((i) => i.indicator === "repo_rate")
+  if (!row) return null
+  const periodStart = new Date(`${row.period}-01T00:00:00Z`) // period is "YYYY-MM"
+  if (Number.isNaN(periodStart.getTime())) return null
+  const age = formatDataAge(Date.now() - periodStart.getTime())
+  return `Unchanged since ${formatPeriodLabel(row.period)} (${age}, no MPC change since).`
 }
 
 function missingIndicatorNote(indicators: MacroIndicatorRow[]): string | null {
@@ -88,16 +150,18 @@ function missingIndicatorNote(indicators: MacroIndicatorRow[]): string | null {
   return `${labels.join(" and ")} ${missing.length === 1 ? "isn't" : "aren't"} available right now, so ${missing.length === 1 ? "it's" : "they're"} left out below.`
 }
 
-// Combines the inflation rate with the user's own balance into one concrete rupee figure —
+// Combines the inflation rate with the user's own balance into one concrete currency figure —
 // this is the "actual synthesis" step, not a restatement of the indicator card above it.
+//
+// The lead line is deliberately a fresh-calculation framing, not a monitoring one: this route
+// runs once per page load, computed from whatever's current at request time — it does not watch
+// anything in the background between visits, so the wording shouldn't imply it does.
 function inflationErosionSentence(
   inflationValue: number,
   balances: BalancesSummary,
-  alreadyExplained: boolean,
+  currencyCode: string,
 ): string {
-  const lead = alreadyExplained
-    ? "You've seen this inflation figure before — here's how it applies to your current balance:"
-    : "Here's what this means for your cash:"
+  const lead = "Comparing today's inflation figure against your balance:"
 
   if (balances.state === "not_blended") {
     if (balances.accounts.length === 0) {
@@ -106,8 +170,8 @@ function inflationErosionSentence(
     const perAccount = balances.accounts.map((a) => {
       const annualErosion = a.closing_balance * (inflationValue / 100)
       const monthlyErosion = annualErosion / 12
-      return `${a.label} (${formatRupees(a.closing_balance)} as of ${a.as_of_month}) is losing about `
-        + `${formatRupees(annualErosion)}/year (~${formatRupees(monthlyErosion)}/month)`
+      return `${a.label} (${formatCurrency(a.closing_balance, currencyCode)} as of ${a.as_of_month}) is losing about `
+        + `${formatCurrency(annualErosion, currencyCode)}/year (~${formatCurrency(monthlyErosion, currencyCode)}/month)`
     })
     return `${lead} your accounts' data is too spread out to combine into one figure, so here's inflation's `
       + `impact per account, assuming each stays in a low-interest account: ${perAccount.join("; ")}.`
@@ -123,8 +187,8 @@ function inflationErosionSentence(
     ? " Note: your accounts' most recent data spans different months, so this figure may not reflect all accounts equally."
     : ""
 
-  return `${lead} your combined balance of ${formatRupees(balances.combined_balance)} is losing about `
-    + `${formatRupees(annualErosion)} a year (~${formatRupees(monthlyErosion)} a month) to inflation at `
+  return `${lead} your combined balance of ${formatCurrency(balances.combined_balance, currencyCode)} is losing about `
+    + `${formatCurrency(annualErosion, currencyCode)} a year (~${formatCurrency(monthlyErosion, currencyCode)} a month) to inflation at `
     + `${inflationValue.toFixed(2)}%, assuming this stays in a low-interest account.${caveat}`
 }
 
@@ -132,14 +196,14 @@ function composeMacroExplanation(
   indicators: MacroIndicatorRow[],
   facts: SemanticFactRow[],
   balances: BalancesSummary,
-  alreadyExplained: boolean,
+  currencyCode: string,
 ): string {
   const sentences: string[] = []
 
   const inflation = indicators.find((i) => i.indicator === "inflation")
   sentences.push(
     inflation
-      ? inflationErosionSentence(Number(inflation.value), balances, alreadyExplained)
+      ? inflationErosionSentence(Number(inflation.value), balances, currencyCode)
       : "Inflation data isn't available right now, so we can't estimate how it's affecting your cash.",
   )
 
@@ -264,26 +328,38 @@ export async function GET() {
   const balances = await buildBalancesSummary(userId)
   const indicators = await getLatestMacroIndicators() as MacroIndicatorRow[]
   const explanationKey = buildExplanationKey(indicators)
+  const gdpPerCapitaAge = gdpPerCapitaAgeNote(indicators)
+  const repoRateUnchanged = repoRateUnchangedNote(indicators)
 
-  // Two kinds of user-level memory are relevant to this synthesis: prior macro-impact facts,
-  // and any distilled balance trend (e.g. "balance has been flat for N months") — both are
-  // account_id IS NULL since they're about the user as a whole, not one account. If neither
-  // exists yet (the common case today — nothing writes trend:balance_snapshot facts yet), the
-  // query just returns empty and the synthesis reads naturally without forcing a reference.
+  const user = await getUserById(userId)
+  const currencyCode = user?.currency ?? DEFAULT_CURRENCY
+
+  // Only fact_types on the MACRO_RELEVANT_FACT_TYPES allow-list — this is a user-level memory
+  // panel (account_id IS NULL), and without the allow-list it would also surface unrelated
+  // user-level fact_types as they get added elsewhere. If none exist yet (the common case
+  // today), the query just returns empty and the synthesis reads naturally without forcing a
+  // reference.
   let facts: SemanticFactRow[] = []
   let alreadyExplained = false
+  // Defaults to true (record) rather than false — if the MCP throttle check below fails, we'd
+  // rather risk one extra snapshot than silently drop real balance data for this visit.
+  let shouldRecordSnapshot = true
   try {
+    const factTypeList = MACRO_RELEVANT_FACT_TYPES.map((t) => `'${t}'`).join(", ")
     facts = await mcpSelectQuery<SemanticFactRow>(`
-      SELECT id, fact_type, category, description, relevance_score, confidence_status
+      SELECT id, fact_type, category, description, relevance_score, confidence_status,
+        occurrence_count, updated_at
       FROM semantic_facts
       WHERE user_id = '${userId}'
         AND account_id IS NULL
-        AND (fact_type = 'macro_impact' OR fact_type = 'trend:balance_snapshot')
+        AND fact_type IN (${factTypeList})
         AND superseded_by IS NULL
       ORDER BY relevance_score DESC
       LIMIT 5
     `)
 
+    // This is scoped to the exact indicator/period combo — used only to decide phrasing below,
+    // never gates whether a snapshot is recorded.
     const priorEvents = await mcpSelectQuery<{ id: string }>(`
       SELECT id FROM episodic_events
       WHERE user_id = '${userId}'
@@ -292,15 +368,29 @@ export async function GET() {
       LIMIT 1
     `)
     alreadyExplained = priorEvents.length > 0
+
+    // Independent of alreadyExplained: has *any* snapshot been recorded recently, regardless of
+    // which indicators/period it was for? This is the write throttle, not a text-repetition check.
+    const recentSnapshot = await mcpSelectQuery<{ id: string }>(`
+      SELECT id FROM episodic_events
+      WHERE user_id = '${userId}'
+        AND event_type = 'macro_explanation'
+        AND created_at > NOW() - INTERVAL '${SNAPSHOT_THROTTLE_HOURS} hours'
+      LIMIT 1
+    `)
+    shouldRecordSnapshot = recentSnapshot.length === 0
   } catch (err) {
     // Memory context is an enhancement, not a hard dependency — degrade to indicators-only
     // rather than failing the whole page if the Managed MCP Server is unreachable.
     console.error("MCP memory lookup failed, degrading to indicators-only:", err)
   }
 
-  const explanation = composeMacroExplanation(indicators, facts, balances, alreadyExplained)
+  const explanation = composeMacroExplanation(indicators, facts, balances, currencyCode)
 
-  if (!alreadyExplained) {
+  // Recording the snapshot happens on every real visit (subject to the throttle above) — this is
+  // what gives the distillation job trend data across multiple check-ins. What text is shown is a
+  // separate concern, already handled by composeMacroExplanation's use of alreadyExplained above.
+  if (shouldRecordSnapshot) {
     try {
       const embedding = await generateEmbedding(explanation)
       await db.insert(episodic_events).values({
@@ -324,11 +414,22 @@ export async function GET() {
     }
   }
 
+  // Distillation is the only writer of semantic_facts, so the most recent updated_at among this
+  // user's own facts is the closest determinable proxy for "when did distillation last touch my
+  // data" — there's no separate per-user last-run timestamp to read instead.
+  const lastDistilledAt = facts.length > 0
+    ? facts.reduce((max, f) => (f.updated_at > max ? f.updated_at : max), facts[0].updated_at)
+    : null
+
   return Response.json({
     indicators,
     facts,
     explanation,
     already_explained: alreadyExplained,
     balances,
+    currency: currencyCode,
+    last_distilled_at: lastDistilledAt,
+    gdp_per_capita_age_note: gdpPerCapitaAge,
+    repo_rate_unchanged_note: repoRateUnchanged,
   })
 }

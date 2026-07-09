@@ -32,7 +32,11 @@ class MacroEconomicData(SQLModel, table=True):
     indicator: MacroIndicator
     period: str  # YYYY-MM
     value: Decimal = Field(sa_column=Column("value", Numeric(12, 4), nullable=False))
-    source: str  # world_bank | rbi
+    # world_bank | rbi | mospi — "mospi" values may carry a suffix identifying a sub-series,
+    # e.g. "mospi (2012=100)" / "mospi (2024=100)" for the CPI base-year transition, or
+    # "mospi_quarterly" for NSO quarterly GDP growth. All mospi-family values start with the
+    # literal prefix "mospi" — see the read-side preference query in app/lib/db/queries/macro.ts.
+    source: str
     fetched_at: datetime = Field(
         default=None,
         sa_column=Column(

@@ -1,7 +1,9 @@
 "use client"
 
 import { useMacro } from "@/lib/hooks/useMacro"
+import { formatCurrency } from "@/lib/currency"
 import { InvestmentScenarioSlider } from "./InvestmentScenarioSlider"
+import { MemoryPanel } from "./MemoryPanel"
 
 const INDICATOR_LABELS: Record<string, string> = {
   repo_rate: "RBI Repo Rate",
@@ -27,24 +29,38 @@ function formatValue(indicator: string, value: string): string {
   return `${n.toFixed(2)}%`
 }
 
-function formatRupees(value: number): string {
-  return `₹${Math.round(value).toLocaleString("en-IN")}`
-}
-
 export function MacroPanel() {
-  const { indicators, facts, explanation, balances, isLoading, isError } = useMacro()
+  const {
+    indicators, facts, explanation, balances, currency, lastDistilledAt,
+    gdpPerCapitaAgeNote, repoRateUnchangedNote,
+    isLoading, isRefreshing, isError, refresh,
+  } = useMacro()
 
   const hasBalanceInfo = balances.accounts.length > 0 || balances.accounts_without_data > 0
+  const hasIndicators = indicators.length > 0
+  const hasRealityContent = hasBalanceInfo || (hasIndicators && !!explanation)
+  const inflationIndicator = indicators.find((i) => i.indicator === "inflation")
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b bg-background px-6 py-4 shrink-0">
         <div>
           <h2 className="text-base font-semibold">Macro Context</h2>
-          <p className="text-xs text-muted-foreground">
-            RBI and World Bank indicators, with distilled context from your history
+          <p className="text-xs text-muted-foreground max-w-md">
+            We track national economic trends (inflation, RBI rate changes) and connect them to
+            your own balance, so you know what they actually mean for your money.
           </p>
         </div>
+        <button
+          onClick={() => refresh()}
+          disabled={isRefreshing}
+          className="flex items-center gap-1.5 rounded-md border border-input px-3 py-1.5 text-xs
+            font-medium text-muted-foreground hover:text-foreground hover:bg-accent
+            transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+        >
+          <span className={isRefreshing ? "animate-spin" : ""}>↻</span>
+          {isRefreshing ? "Refreshing…" : "Refresh"}
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
@@ -60,80 +76,25 @@ export function MacroPanel() {
           </div>
         ) : (
           <>
-            {hasBalanceInfo && (
-              <div className="rounded-xl border bg-card p-5 space-y-3">
-                <p className="text-sm font-semibold text-slate-700">Cash across your accounts</p>
-
-                {balances.state !== "not_blended" && balances.combined_balance != null && (
-                  <div className="space-y-2">
-                    <p className="text-2xl font-semibold text-slate-800">
-                      {formatRupees(balances.combined_balance)}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Combined across {balances.accounts.length} account
-                      {balances.accounts.length === 1 ? "" : "s"} · reference month {balances.reference_month}
-                    </p>
-                    {balances.state === "blended_with_caveat" && (
-                      <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
-                        <span className="text-amber-500 shrink-0">⚠️</span>
-                        <p className="text-xs text-amber-700">
-                          Your accounts&apos; most recent data spans different months — this total
-                          may not be perfectly aligned. See the breakdown below.
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {balances.state === "not_blended" && (
-                  <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
-                    <span className="text-amber-500 shrink-0">⚠️</span>
-                    <p className="text-xs text-amber-700">
-                      Your accounts&apos; data is too far apart (or one hasn&apos;t been updated in a
-                      while) to combine into a single figure — shown separately below.
-                    </p>
-                  </div>
-                )}
-
-                {balances.accounts.length > 0 && (
-                  <div className="space-y-1.5">
-                    {balances.accounts.map((a) => (
-                      <div key={a.account_id} className="flex items-center justify-between text-xs">
-                        <span className="font-medium text-slate-700">
-                          {a.label}
-                          {a.excluded_from_blend && (
-                            <span className="ml-1.5 text-amber-600">(too stale to combine)</span>
-                          )}
-                        </span>
-                        <span className="text-muted-foreground">
-                          {formatRupees(a.closing_balance)} · as of {a.as_of_month}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {balances.accounts_without_data > 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    {balances.accounts_without_data} account
-                    {balances.accounts_without_data === 1 ? "" : "s"} with no uploaded data yet —
-                    excluded above.
-                  </p>
-                )}
-              </div>
-            )}
-
-            {indicators.length === 0 ? (
-              <div className="flex flex-col h-48 items-center justify-center gap-2 text-center">
-                <p className="text-3xl">🌐</p>
-                <p className="font-semibold text-slate-700">No macro data yet</p>
-                <p className="text-sm text-muted-foreground max-w-sm">
-                  Macro-economic indicators haven&apos;t been ingested yet. Run the macro ingestion
-                  job to populate RBI and World Bank data.
+            {/* Context — the economic backdrop, national data, not specific to you */}
+            <section className="space-y-4">
+              <div className="space-y-1">
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Context</p>
+                <p className="text-xs text-muted-foreground">
+                  The economic backdrop — national data, not specific to you.
                 </p>
               </div>
-            ) : (
-              <>
+
+              {!hasIndicators ? (
+                <div className="flex flex-col h-48 items-center justify-center gap-2 text-center">
+                  <p className="text-3xl">🌐</p>
+                  <p className="font-semibold text-slate-700">No macro data yet</p>
+                  <p className="text-sm text-muted-foreground max-w-sm">
+                    Macro-economic indicators haven&apos;t been ingested yet. Run the macro ingestion
+                    job to populate RBI and World Bank data.
+                  </p>
+                </div>
+              ) : (
                 <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
                   {indicators.map((i) => (
                     <div key={i.indicator} className="rounded-xl border bg-card p-4 space-y-1">
@@ -144,47 +105,125 @@ export function MacroPanel() {
                       <p className="text-xl font-semibold text-slate-800">
                         {formatValue(i.indicator, i.value)}
                       </p>
-                      <p className="text-xs text-muted-foreground">
-                        {i.period} · {i.source}
-                      </p>
+                      {i.indicator === "gdp_per_capita" && gdpPerCapitaAgeNote ? (
+                        <p className="text-xs text-amber-600">{gdpPerCapitaAgeNote}</p>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">
+                          {i.period} · {i.source}
+                        </p>
+                      )}
+                      {i.indicator === "repo_rate" && repoRateUnchangedNote && (
+                        <p className="text-xs text-muted-foreground">{repoRateUnchangedNote}</p>
+                      )}
                     </div>
                   ))}
                 </div>
+              )}
+            </section>
 
-                {explanation && (
-                  <div className="rounded-xl border bg-slate-50 p-5">
-                    <p className="text-sm font-semibold text-slate-700 mb-2">What this means for you</p>
-                    <p className="text-sm text-slate-600 leading-relaxed">{explanation}</p>
-                  </div>
-                )}
+            {/* Reality — what's actually true for you, now and over time */}
+            {hasRealityContent && (
+              <section className="space-y-4">
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Your actual situation</p>
+                </div>
 
-                {(() => {
-                  const inflation = indicators.find((i) => i.indicator === "inflation")
-                  if (!inflation) return null
-                  return (
-                    <InvestmentScenarioSlider
-                      defaultAmount={balances.combined_balance ?? 0}
-                      inflationRate={Number(inflation.value)}
-                    />
-                  )
-                })()}
-
-                {facts.length > 0 && (
+                {hasBalanceInfo && (
                   <div className="rounded-xl border bg-card p-5 space-y-3">
-                    <p className="text-sm font-semibold text-slate-700">Remembered from your history</p>
-                    <div className="space-y-2">
-                      {facts.map((f) => (
-                        <div key={f.id} className="flex items-start gap-2 text-xs">
-                          <span className="text-muted-foreground shrink-0">
-                            {f.confidence_status === "confirmed" ? "✅" : "🤔"}
-                          </span>
-                          <span className="text-slate-600">{f.description}</span>
-                        </div>
-                      ))}
-                    </div>
+                    <p className="text-sm font-semibold text-slate-700">Cash across your accounts</p>
+
+                    {balances.state !== "not_blended" && balances.combined_balance != null && (
+                      <div className="space-y-2">
+                        <p className="text-2xl font-semibold text-slate-800">
+                          {formatCurrency(balances.combined_balance, currency)}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Combined across {balances.accounts.length} account
+                          {balances.accounts.length === 1 ? "" : "s"} · reference month {balances.reference_month}
+                        </p>
+                        {balances.state === "blended_with_caveat" && (
+                          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                            <span className="text-amber-500 shrink-0">⚠️</span>
+                            <p className="text-xs text-amber-700">
+                              Your accounts&apos; most recent data spans different months — this total
+                              may not be perfectly aligned. See the breakdown below.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {balances.state === "not_blended" && (
+                      <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                        <span className="text-amber-500 shrink-0">⚠️</span>
+                        <p className="text-xs text-amber-700">
+                          Your accounts&apos; data is too far apart (or one hasn&apos;t been updated in a
+                          while) to combine into a single figure — shown separately below.
+                        </p>
+                      </div>
+                    )}
+
+                    {balances.accounts.length > 0 && (
+                      <div className="space-y-1.5">
+                        {balances.accounts.map((a) => (
+                          <div key={a.account_id} className="flex items-center justify-between text-xs">
+                            <span className="font-medium text-slate-700">
+                              {a.label}
+                              {a.excluded_from_blend && (
+                                <span className="ml-1.5 text-amber-600">(too stale to combine)</span>
+                              )}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {formatCurrency(a.closing_balance, currency)} · as of {a.as_of_month}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {balances.accounts_without_data > 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        {balances.accounts_without_data} account
+                        {balances.accounts_without_data === 1 ? "" : "s"} with no uploaded data yet —
+                        excluded above.
+                      </p>
+                    )}
                   </div>
                 )}
-              </>
+
+                {hasIndicators && explanation && (
+                  <div className="rounded-xl border bg-slate-50 p-5 space-y-4">
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <p className="text-sm font-semibold text-slate-700">What this means for you</p>
+                        <span
+                          className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary cursor-help"
+                          title="This is personalized synthesis — it combines the indicators above with your own account balance. It's not another data card; the numbers here are computed specifically for you."
+                        >
+                          Personalized
+                        </span>
+                      </div>
+                      <p className="text-sm text-slate-600 leading-relaxed">{explanation}</p>
+                    </div>
+
+                    <MemoryPanel facts={facts} lastDistilledAt={lastDistilledAt} />
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* Action — the one interactive thing the page invites you to do */}
+            {hasIndicators && inflationIndicator && (
+              <section className="space-y-4">
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">What you can do about it</p>
+                </div>
+                <InvestmentScenarioSlider
+                  defaultAmount={balances.combined_balance ?? 0}
+                  inflationRate={Number(inflationIndicator.value)}
+                  currencyCode={currency}
+                />
+              </section>
             )}
           </>
         )}

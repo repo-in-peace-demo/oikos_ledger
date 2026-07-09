@@ -39,6 +39,35 @@ RBI_REPO_RATE_SEED: list[tuple[str, str]] = [
     ("2025-12", "5.25"),
 ]
 
+# World Bank's inflation and GDP growth figures are annual and ~18 months stale by the time
+# they're published. MoSPI publishes CPI monthly (~5-6 week lag via PIB press releases) and GDP
+# growth quarterly via NSO — far more current — but, like the RBI repo rate, has no stable public
+# JSON/REST API. Manually curated from official MoSPI/PIB press releases; append a row after each
+# monthly CPI release or quarterly GDP release.
+#
+# CPI base-year transition — deliberately NOT spliced into one continuous series: the 2012=100
+# series ended with the December 2025 release; the 2024=100 series began with the January 2026
+# release (new item basket, weighted on the 2023-24 Household Consumption Expenditure Survey).
+# Each row's `source` records which base-year series it came from, rather than presenting both
+# as one uninterrupted series.
+MOSPI_CPI_SEED: list[tuple[str, str, str]] = [
+    # (period, value, source)
+    ("2025-11", "2.95", "mospi (2012=100)"),
+    ("2025-12", "2.86", "mospi (2012=100)"),
+    ("2026-01", "2.75", "mospi (2024=100)"),
+    # Feb 2026 intentionally omitted — figure not confirmed at seed time, left as a gap rather
+    # than guessed.
+    ("2026-03", "3.40", "mospi (2024=100)"),
+    ("2026-04", "3.48", "mospi (2024=100)"),
+    ("2026-05", "3.93", "mospi (2024=100)"),
+]
+
+# NSO/MoSPI quarterly real GDP growth (year-on-year), stored at the quarter's end month.
+MOSPI_GDP_GROWTH_SEED: list[tuple[str, str, str]] = [
+    # Q4 FY2025-26 (Jan-Mar 2026) provisional estimate, released 2026-06-05.
+    ("2026-03", "7.8", "mospi_quarterly"),
+]
+
 
 def fetch_world_bank_indicator(indicator: MacroIndicator, per_page: int = 20) -> list[dict[str, Any]]:
     """Fetch an annual time series for one World Bank indicator for India.
@@ -58,6 +87,22 @@ def fetch_world_bank_indicator(indicator: MacroIndicator, per_page: int = 20) ->
 def fetch_rbi_repo_rate() -> list[dict[str, str]]:
     """Return the manually-curated RBI policy repo rate series (see RBI_REPO_RATE_SEED)."""
     return [{"period": period, "value": value} for period, value in RBI_REPO_RATE_SEED]
+
+
+def fetch_mospi_cpi() -> list[dict[str, str]]:
+    """Return the manually-curated MoSPI CPI inflation series (see MOSPI_CPI_SEED)."""
+    return [
+        {"period": period, "value": value, "source": source}
+        for period, value, source in MOSPI_CPI_SEED
+    ]
+
+
+def fetch_mospi_gdp_growth() -> list[dict[str, str]]:
+    """Return the manually-curated NSO/MoSPI quarterly GDP growth series (see MOSPI_GDP_GROWTH_SEED)."""
+    return [
+        {"period": period, "value": value, "source": source}
+        for period, value, source in MOSPI_GDP_GROWTH_SEED
+    ]
 
 
 def upsert_macro_indicator(
@@ -118,6 +163,26 @@ def run_macro_ingestion() -> dict[str, int]:
             )
         counts[MacroIndicator.repo_rate.value] = len(repo_rows)
         log.info("Fetched %s rows for repo_rate from RBI seed", len(repo_rows))
+
+        # MoSPI seed data — see MOSPI_CPI_SEED / MOSPI_GDP_GROWTH_SEED. Separate count keys
+        # (not overwriting the World Bank counts above) since both sources write the same
+        # indicators; the read side in app/lib/db/queries/macro.ts prefers whichever MoSPI row
+        # is present over World Bank's.
+        mospi_cpi_rows = fetch_mospi_cpi()
+        for row in mospi_cpi_rows:
+            upsert_macro_indicator(
+                session, MacroIndicator.inflation, row["period"], Decimal(row["value"]), source=row["source"],
+            )
+        counts["inflation_mospi"] = len(mospi_cpi_rows)
+        log.info("Fetched %s rows for inflation from MoSPI seed", len(mospi_cpi_rows))
+
+        mospi_gdp_rows = fetch_mospi_gdp_growth()
+        for row in mospi_gdp_rows:
+            upsert_macro_indicator(
+                session, MacroIndicator.gdp_growth, row["period"], Decimal(row["value"]), source=row["source"],
+            )
+        counts["gdp_growth_mospi"] = len(mospi_gdp_rows)
+        log.info("Fetched %s rows for gdp_growth from MoSPI seed", len(mospi_gdp_rows))
 
     return counts
 
