@@ -315,8 +315,8 @@ export function TransactionsPanel() {
           </div>
         ) : (
           grouped.map(([key, group]) => {
-            console.log("[grouped keys]", grouped.map(([key]) => key))
-            console.log("[balanceByMonth keys]", Object.keys(balanceByMonth))
+            // console.log("[grouped keys]", grouped.map(([key]) => key))
+            // console.log("[balanceByMonth keys]", Object.keys(balanceByMonth))
             const monthBalance = balanceByMonth[key]
             return (
               <TransactionGroup
