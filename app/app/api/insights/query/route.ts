@@ -3,6 +3,8 @@ import { db, dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import OpenAI from "openai"
 import { mcpSelectQuery } from "@/lib/mcp/client"
+import { logError } from "@/lib/logger"
+import { getTransactionsDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
 
 export const dynamic = "force-dynamic"
 
@@ -27,26 +29,54 @@ const openai = new OpenAI({
 const FACT_SIMILARITY_THRESHOLD = 0.35
 const FACT_SIMILARITY_LIMIT = 3
 
+// --- Timeout budget sizing policy (applies to every budget below) -------------------------
+// Every one of these has previously been sized against "typical" or "one sample seen so far"
+// latency and then failed in production against real variance — most recently: a cache-HIT
+// request timed out at 1231ms against a 1200ms budget, stuck entirely in embedding generation
+// (proving OpenAI's embedding API alone can exceed that budget, with no MCP/CockroachDB
+// involvement at all), and the category-lookup query separately timed out against its 300ms
+// budget in production. Going forward, each budget below is sized against the worst latency
+// actually observed for that specific call shape, with real multiplicative margin over it — not
+// "just above the one number seen so far" — and the evidence for each number is stated inline
+// rather than left as a bare constant. Where that's not fully achievable (see FACT_MISS_TIMEOUT_MS
+// below) it's flagged explicitly as a judgment call, not silently under-margined again.
+
 // Facts freshness marker check — a direct-SQL (not MCP) read of MAX(updated_at) across this
-// user+account's confirmed, non-superseded facts. Cheap indexed aggregate, not the expensive
-// operation, so it gets its own short budget. A failure or timeout here is treated as "unknown"
-// (never blocks) — it just forces the slower cache-miss path below rather than risking a stale hit.
-const FACT_MARKER_TIMEOUT_MS = 300
+// user+account's confirmed, non-superseded facts. Previously 300ms, sized only against this
+// query's own steady-state samples (~29-35ms in earlier testing) — but the category-lookup query
+// below is the same shape (direct SQL, small indexed table) and has been directly observed
+// exceeding its own 300ms budget in production. CockroachDB Basic scales to zero when idle
+// (confirmed separately, see challenges.md — intermittent multi-second latency was found to be
+// session-wide, affecting a connection's calls uniformly regardless of query complexity), so a
+// trivial query is not insulated from a cold-cluster event the way "cheap indexed aggregate"
+// sizing assumed. Raised to 1500ms — 5x the steady-state samples, meaningful (not complete)
+// protection against a moderate cold-cluster event, without this preliminary check itself
+// ballooning to multi-second cost on every request. A failure or timeout is still treated as
+// "unknown" (never blocks) — it just forces the slower cache-miss path below.
+const FACT_MARKER_TIMEOUT_MS = 1500
 
 // Two budgets, not one, because the two outcomes below have very different real cost:
 //   - Cache HIT (marker unchanged since last fetch): only the embedding call runs, no MCP at all.
-//     Measured 479-887ms for the embedding call alone across 5 live end-to-end runs (one outlier
-//     at 2423ms on a cold first call) — 900ms left only ~13ms of margin over the 887ms sample, too
-//     tight given that's real observed variance, not a hypothetical; 1200ms leaves real headroom.
+//     Was 1200ms. Directly falsified in production: a real cache-HIT request timed out at 1231ms,
+//     stuck entirely in embedding generation — confirming the embedding call alone, independent of
+//     MCP/CockroachDB entirely, can exceed 1200ms. Combined with an earlier direct measurement of a
+//     2423ms embedding call in this same investigation, raised to 2500ms — clears both the
+//     confirmed production failure and the worst directly-measured sample with real margin, not
+//     a marginal bump.
 //   - Cache MISS (first request for this user+account, or facts changed since): still needs the
-//     full embedding + MCP round trip. Measured MCP round trip alone at 718-6246ms (the high end
-//     specifically the first select_query call after a connection is opened — a real, recurring
-//     cost on a serverless platform where instances cycle) — 3500ms leaves margin over the
-//     steady-state end of that range, though the most extreme cold-start case can still exceed it.
+//     full embedding + MCP round trip. Measured MCP round trip alone at 718-6246ms in the
+//     connection-warming investigation. Not explicitly re-scoped by name, but raised here (3500 ->
+//     6500ms) for internal consistency: left at 3500ms, this budget would now be smaller than the
+//     hit-path embedding budget (2500ms) plus any nontrivial MCP time at all, which makes no sense
+//     given the miss path strictly does more work than the hit path. 6500ms covers embedding's
+//     worst case plus a substantial share of the documented MCP worst case, but does NOT reach
+//     full 2x margin over the combined worst case (~9000ms+) — that would mean a real user could
+//     wait 9+ seconds before a graceful degrade, which is judged an unacceptable UX tradeoff even
+//     under a "err toward reliability" instruction. Flagging this explicitly as a judgment call.
 // Voice is latency-sensitive (challenges.md); a miss taking multiple seconds is exactly why caching
-// this was worth doing — most turns should now land on the fast (1200ms) path, not the slow one.
-const FACT_HIT_TIMEOUT_MS = 1200
-const FACT_MISS_TIMEOUT_MS = 3500
+// this was worth doing — most turns should now land on the fast (2500ms) path, not the slow one.
+const FACT_HIT_TIMEOUT_MS = 2500
+const FACT_MISS_TIMEOUT_MS = 6500
 
 const BLOCKED_KEYWORDS = [
   "drop", "delete", "update", "insert", "truncate",
@@ -188,29 +218,61 @@ function buildContextualQueryText(question: string, history: HistoryEntry[]): st
   return [...recentUserTurns, question].join(" ")
 }
 
-// The categories table is a small, stable global taxonomy (not per-user data, rarely changes) —
-// cached indefinitely for the life of a warm instance rather than behind a freshness marker like
-// semantic_facts. Names are cached lowercased since every call site only ever compares against a
-// lowercased question. A failed lookup degrades to an empty list (no category-aware bypass, not a
-// hard failure) — the pre-existing keyword classifier below still runs either way.
-let categoryNamesCache: string[] | null = null
+// The categories table is a small, stable global taxonomy (not per-user data, rarely changes).
+// Previously a blocking DB read with its own 300ms timeout, which was directly observed exceeding
+// that budget in production ("Category lookup exceeded 300ms budget... degraded to off").
+// Raising the timeout again would just repeat the pattern this whole fix is trying to move past —
+// the actual mistake was blocking the classifier's hot path on a live DB round trip at all, for
+// data that barely ever changes. Fixed instead by never blocking on it: a static snapshot (below)
+// serves every request immediately with zero latency and zero DB dependency, while a background,
+// fire-and-forget refresh (at most once per warm instance) keeps the live cache current for
+// whichever request happens to arrive after it resolves. Worst case if the live table has
+// genuinely changed since this snapshot was taken: a newly-added category isn't recognized by the
+// bypass until the background refresh completes — the keyword classifier still runs regardless,
+// so this only ever affects whether the category-bypass fires, never a hard failure.
+//
+// Snapshot taken directly from the live categories table, 2026-07 (45 rows) — update this list if
+// the category taxonomy changes meaningfully; the background refresh does not persist beyond a
+// given warm instance's lifetime.
+const STATIC_CATEGORY_NAMES_FALLBACK = [
+  "activities", "books", "clothing", "coffee", "courses", "credit card payment",
+  "dining out", "doctor", "emi", "education", "electronics", "entertainment", "events",
+  "fees", "finance", "flights", "food", "food delivery", "fuel", "groceries", "gym",
+  "health", "hobbies", "home", "hotels", "housing", "insurance", "internet", "investment",
+  "maintenance", "movies", "other", "parking", "personal care", "pharmacy",
+  "public transport", "rent", "ride share", "shopping", "streaming", "subscriptions",
+  "transport", "travel", "uncategorized", "utilities",
+]
 
-async function getCategoryNames(): Promise<string[]> {
-  if (categoryNamesCache) return categoryNamesCache
+let categoryNamesCache: string[] | null = null
+let categoryNamesRefreshStarted = false
+
+async function refreshCategoryNamesCache(): Promise<void> {
   try {
     const result = (await dbReadonly.execute(
       sql.raw(`SELECT name FROM categories`),
     )) as unknown as { rows: { name: string }[] }
     categoryNamesCache = result.rows.map((row) => row.name.toLowerCase())
-    return categoryNamesCache
   } catch (err) {
-    console.error(
-      "Failed to load category names for intent classification — category-aware "
-      + "pre-built-intent bypass degraded to off, keyword classifier still runs:",
-      err,
-    )
-    return []
+    logError({
+      context: "refreshCategoryNamesCache",
+      error: err,
+      note: "keeping static fallback list for this instance; will retry on the next cold instance",
+    })
   }
+}
+
+async function getCategoryNames(): Promise<string[]> {
+  if (categoryNamesCache) return categoryNamesCache
+
+  // Fire-and-forget, at most once per warm instance — never awaited, so this can never add
+  // latency to the caller no matter how slow (or how it fails) the underlying query is.
+  if (!categoryNamesRefreshStarted) {
+    categoryNamesRefreshStarted = true
+    refreshCategoryNamesCache()
+  }
+
+  return STATIC_CATEGORY_NAMES_FALLBACK
 }
 
 async function hashQuery(text: string): Promise<string> {
@@ -320,18 +382,24 @@ async function getFactsFreshnessMarkerOrUnknown(
   try {
     const result = await Promise.race([work, timeout])
     if (timedOut) {
-      console.error(
-        `Facts freshness marker check exceeded ${FACT_MARKER_TIMEOUT_MS}ms — `
-        + `treating as unknown (forces a fresh MCP fetch)`,
-      )
+      logError({
+        context: "getFactsFreshnessMarkerOrUnknown",
+        error: new Error(`Marker check exceeded ${FACT_MARKER_TIMEOUT_MS}ms budget`),
+        userId,
+        accountId,
+        note: "treating as unknown — forces a fresh MCP fetch",
+      })
       return "unknown"
     }
     return result as string | null
   } catch (err) {
-    console.error(
-      "Facts freshness marker check failed — treating as unknown (forces a fresh MCP fetch):",
-      err,
-    )
+    logError({
+      context: "getFactsFreshnessMarkerOrUnknown",
+      error: err,
+      userId,
+      accountId,
+      note: "treating as unknown — forces a fresh MCP fetch",
+    })
     return "unknown"
   }
 }
@@ -356,13 +424,26 @@ async function getFactsFreshnessMarkerOrUnknown(
 // budgets below rather than one: a hit only pays for the embedding call, a miss still pays for the
 // full embedding + MCP round trip.
 //
-// Takes contextual query text (see buildContextualQueryText), not a precomputed embedding — the
-// query_cache Tier-2 embedding is deliberately not reused here. That embedding is of the literal
-// current-turn question only (correct for its own purpose — matching this exact question against
-// past exact questions), but a bare follow-up like "savings for the last seven days" carries no
-// topical signal on its own when the topic was established in an earlier turn. This does mean a
-// second embeddings call rather than reusing one — unavoidable, since the question embedding
-// always changes per turn even when the candidate facts don't.
+// Takes both the isolated current-turn question and the contextual query text (see
+// buildContextualQueryText) — not a precomputed embedding, since the query_cache Tier-2 embedding
+// is of the literal current-turn question only and is deliberately not reused here.
+//
+// Scoring uses MIN(isolated similarity, contextual similarity), not just the contextual score —
+// this fixes a confirmed false positive: folding the prior turn "how has my balance been lately"
+// into an unrelated follow-up like "plot my food expenses for last month" pushed the *contextual*
+// score to ~0.43 (clears 0.35), even though the follow-up alone scores 0.24 (correctly below
+// threshold) and shares no actual topic with the balance fact — the prior turn's topic bled into
+// the combined embedding, manufacturing a match the current question doesn't support on its own.
+// Requiring the isolated score to *also* clear the threshold blocks that: a real continuation like
+// "savings for the last seven days" already scores 0.42 alone (above threshold on its own, and higher
+// still combined with context), so it isn't affected by this — the two cases are well separated by
+// this check, confirmed empirically, not assumed. Deliberately reuses the existing
+// FACT_SIMILARITY_THRESHOLD for both scores rather than introducing a second tunable number.
+//
+// Both embeddings are generated concurrently (Promise.all), not sequentially, to avoid roughly
+// doubling this step's wall-clock latency now that there's a second OpenAI call — and skipped
+// entirely when there's no prior history (isolated text === contextual text), so a first-turn
+// question still only ever pays for one embedding call, exactly as before this fix.
 //
 // Hard-timeout + degrade, same pattern as /api/macro's "MCP memory lookup failed, degrading to
 // indicators-only": if this doesn't complete within budget, or either call fails outright, proceed
@@ -373,6 +454,7 @@ async function getFactsFreshnessMarkerOrUnknown(
 async function getRelevantFactDescriptions(
   userId: string,
   accountId: string,
+  isolatedQuestionText: string,
   contextualQueryText: string,
 ): Promise<string[]> {
   const startedAt = Date.now()
@@ -395,7 +477,13 @@ async function getRelevantFactDescriptions(
 
   const work = (async () => {
     const embeddingStartedAt = Date.now()
-    const questionEmbedding = await generateEmbedding(contextualQueryText)
+    const hasContext = isolatedQuestionText !== contextualQueryText
+    const [contextualEmbedding, isolatedEmbedding] = await Promise.all([
+      generateEmbedding(contextualQueryText),
+      // No prior history means the two texts are identical — skip the redundant second call
+      // rather than pay for (and wait on) an embedding of text already being embedded above.
+      hasContext ? generateEmbedding(isolatedQuestionText) : Promise.resolve(null),
+    ])
     embeddingMs = Date.now() - embeddingStartedAt
 
     let candidates: FactCandidate[]
@@ -428,10 +516,20 @@ async function getRelevantFactDescriptions(
     // Returns ALL scored candidates, unfiltered — filtering/sorting/slicing happens in the outer
     // scope below, only once we know this result actually won the race against the timeout (see
     // the bug this fixes, in logSimilarityOutcome's comment).
-    return candidates.map((c) => ({
-      description: c.description,
-      similarity: cosineSimilarity(questionEmbedding, c.embedding),
-    }))
+    //
+    // similarity is MIN(contextual, isolated) — see this function's doc comment for why. When
+    // there's no history, isolatedEmbedding is null and contextualEmbedding IS the isolated
+    // embedding (identical text), so the two scores are the same value anyway.
+    return candidates.map((c) => {
+      const contextualSimilarity = cosineSimilarity(contextualEmbedding, c.embedding)
+      const isolatedSimilarity = isolatedEmbedding
+        ? cosineSimilarity(isolatedEmbedding, c.embedding)
+        : contextualSimilarity
+      return {
+        description: c.description,
+        similarity: Math.min(contextualSimilarity, isolatedSimilarity),
+      }
+    })
   })()
 
   // Logs whether a match cleared FACT_SIMILARITY_THRESHOLD, and its score — or that nothing did.
@@ -517,14 +615,20 @@ async function getRelevantFactDescriptions(
       .slice(0, FACT_SIMILARITY_LIMIT)
       .map((row) => row.description)
   } catch (err) {
-    console.error(
-      `Semantic facts similarity search FAILED during "${step}" after ${Date.now() - startedAt}ms `
-      + `(${isHit ? "cache hit" : "cache miss"} path; marker check: ${markerMs}ms, `
-      + `embedding: ${embeddingMs ?? "did not finish"}ms, `
-      + `mcp_query: ${mcpMs ?? (isHit ? "skipped (cache hit)" : "did not finish")}ms) `
-      + `— degrading to no memory context. Error:`,
-      err,
-    )
+    logError({
+      context: `getRelevantFactDescriptions.${step}`,
+      error: err,
+      userId,
+      accountId,
+      isolatedQuestionText,
+      contextualQueryText,
+      isHit,
+      elapsedMs: Date.now() - startedAt,
+      markerMs,
+      embeddingMs,
+      mcpMs,
+      note: "degrading to no memory context",
+    })
     return []
   }
 }
@@ -545,11 +649,23 @@ async function getExactCacheHit(
       LIMIT 1
     `))) as unknown as { rows: Record<string, unknown>[] }
 
-    if (result.rows.length > 0) {
-      return result.rows[0].result as Record<string, unknown>
+    if (result.rows.length === 0) {
+      return null
     }
-    return null
-  } catch {
+
+    const cached = result.rows[0].result as Record<string, unknown>
+    // TTL alone doesn't catch data changes within the 24h window — a transaction deleted or
+    // added after this entry was written would otherwise keep being served verbatim. Compares
+    // against the marker stored at write time (see writeCacheEntry); a mismatch (including an
+    // older entry that predates this fix and has no stored marker at all) means stale — fall
+    // through to a fresh computation rather than serve it.
+    const currentMarker = await getTransactionsDataMarkerOrUnknown(userId, accountId)
+    if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
+      return null
+    }
+    return cached
+  } catch (err) {
+    logError({ context: "getExactCacheHit", error: err, userId, accountId, queryHash })
     return null
   }
 }
@@ -579,7 +695,8 @@ async function getSimilarCacheHits(
       query_text: r.query_text as string,
       query_hash: r.query_hash as string,
     }))
-  } catch {
+  } catch (err) {
+    logError({ context: "getSimilarCacheHits", error: err, userId, accountId, queryHash })
     return []
   }
 }
@@ -604,7 +721,8 @@ async function getCacheByHash(
       return result.rows[0].result as Record<string, unknown>
     }
     return null
-  } catch {
+  } catch (err) {
+    logError({ context: "getCacheByHash", error: err, userId, accountId, queryHash })
     return null
   }
 }
@@ -618,6 +736,14 @@ async function writeCacheEntry(
   responseData: Record<string, unknown>,
 ): Promise<void> {
   try {
+    // "unknown" (timeout/failure) is stored as null, not a placeholder string — null can never
+    // equal a real marker value on a later read, so an entry written under an unverifiable
+    // baseline is permanently treated as stale rather than accidentally trusted later.
+    const dataMarker = await getTransactionsDataMarkerOrUnknown(userId, accountId)
+    const payload = {
+      ...responseData,
+      _data_marker: dataMarker === "unknown" ? null : dataMarker,
+    }
     await db.execute(sql.raw(`
       INSERT INTO query_cache (
         user_id, account_id, query_hash, query_text,
@@ -629,7 +755,7 @@ async function writeCacheEntry(
         '${queryHash}',
         '${queryText.replace(/'/g, "''")}',
         '[${embedding.join(",")}]'::vector,
-        '${JSON.stringify(responseData).replace(/'/g, "''")}',
+        '${JSON.stringify(payload).replace(/'/g, "''")}',
         NOW() + INTERVAL '24 hours'
       )
       ON CONFLICT (user_id, account_id, query_hash)
@@ -639,7 +765,7 @@ async function writeCacheEntry(
         expires_at = NOW() + INTERVAL '24 hours'
     `))
   } catch (err) {
-    console.error("Cache write failed:", err)
+    logError({ context: "writeCacheEntry", error: err, userId, accountId, queryHash, queryText })
   }
 }
 
@@ -665,6 +791,14 @@ const AGENT_SYSTEM_PROMPT = (
 ) => {
   const today = new Date().toISOString().split("T")[0]
   const currentYear = today.slice(0, 4)
+  // Computed from the parsed Y/M components directly, not via Date mutation (setMonth on a
+  // Date built from `today` is timezone-dependent and can land on the wrong side of a month
+  // boundary) — used only to give the "last month" rule below a concrete, correct label to anchor
+  // its worked example to, generalizing across any request date including year boundaries
+  // (Date.UTC rolls a negative month index back into the prior year correctly).
+  const [todayYear, todayMonthNum] = today.split("-").map(Number)
+  const lastMonthLabel = new Date(Date.UTC(todayYear, todayMonthNum - 2, 1))
+    .toLocaleString("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
   // Grounding context only — never a forced reference. If nothing cleared the similarity
   // threshold (the common case until distillation has produced confirmed facts), this is empty
   // and the prompt reads exactly as it did before this context existed.
@@ -712,6 +846,27 @@ SQL Rules (always enforced):
   - Example: "last 3 months" →
     transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
     AND transaction_date <= CURRENT_DATE
+  - "Last month" (singular, no number) is NOT the same pattern as "last N
+    months" above. It means the ONE complete calendar month immediately
+    before the current one — a closed, already-ended month, never a rolling
+    window up to today. It needs an EXCLUSIVE upper bound at the start of
+    the current month, not "<= CURRENT_DATE" (that pattern is only for
+    "last N months", which deliberately includes the current partial month):
+    transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND transaction_date < DATE_TRUNC('month', CURRENT_DATE)
+  - CORRECT — "last month" as of today (${today}):
+    transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND transaction_date < DATE_TRUNC('month', CURRENT_DATE)
+    This resolves to all of ${lastMonthLabel}, and only ${lastMonthLabel} —
+    never any part of the current month, and never any other month.
+  - WRONG: any interval offset other than exactly '1 month' for "last
+    month" (e.g. '- INTERVAL 4 months' or '5 months') — "last month" is
+    always exactly one month back, with no other number involved anywhere
+    in the query.
+  - WRONG: transaction_date <= CURRENT_DATE as the upper bound for "last
+    month" — that silently pulls in the current month's transactions too,
+    which "last month" (an already-ended, complete month) must never
+    include.
   - "Last N days" is an inclusive range that includes today — today counts as
     one of the N days. The correct lower bound is
     CURRENT_DATE - INTERVAL '(N-1) days', NOT CURRENT_DATE - INTERVAL 'N days'
@@ -885,7 +1040,19 @@ async function runAgentLoop(
     inferredAgentChart = parsed.chart_type?.trim().toLowerCase() ?? ""
     console.log("tool args parsed:", JSON.stringify({ parsedSQL: parsedSQL.slice(0, 80), chart_type: inferredAgentChart }))
     console.log("agent SQL:", parsedSQL, "Agent structural chart:", inferredAgentChart)
-  } catch {
+  } catch (err) {
+    // toolCallArgs is the raw, unparsed string the model returned as its tool_call arguments —
+    // logging it verbatim is what makes this diagnosable: was it truncated mid-stream, malformed
+    // JSON, missing a required field, etc. Without it, this failure mode is invisible server-side
+    // even though the user sees a generic "I had trouble generating the query" message.
+    logError({
+      context: "runAgentLoop.parseToolCall",
+      error: err,
+      userId,
+      accountId,
+      question,
+      toolCallArgs,
+    })
     return {
       type: "direct_response",
       response: "I had trouble generating the query. Could you rephrase?",
@@ -986,6 +1153,7 @@ export async function POST(request: Request) {
     date_from,
     date_to,
     is_voice,
+    prefetch,
   } = body
 
   if (!account_id) {
@@ -993,6 +1161,53 @@ export async function POST(request: Request) {
   }
 
   const userId = session.user.id
+
+  // Fire-and-forget cache/cluster warm-up, triggered from the Macro page and Insights panel on
+  // mount — see their prefetch effects for the full rationale. Deliberately handled inside this
+  // same route (not a separate /api/insights/prefetch endpoint) so it shares this function's
+  // module-scope factCandidatesCache instance: a separate API route deploys as its own serverless
+  // function with its own memory, so warming a cache there would never be visible to a real
+  // question handled by this endpoint. Short-circuits before any of the heavier logic below
+  // (query_cache tiers, agent loop) — this only ever needs to run getRelevantFactDescriptions.
+  //
+  // Honest scope: a follow-up latency investigation found the multi-second spikes this warms
+  // against are intermittent and connection-session-wide (~1 in 8 sessions in testing), not tied
+  // to a specific query shape or a one-time connection warm-up cost — root cause not conclusively
+  // isolated between query-plan caching, connection-layer warm-up, and shared infrastructure
+  // contention (see the latency investigation for the raw data). This means prefetching reduces
+  // the odds of a slow session landing on the user's real first question, by moving that cost
+  // earlier — it does NOT guarantee elimination, since a slow session could still occur later in
+  // the same session, unrelated to whether this already ran. Treat as a mitigation, not a fix.
+  if (prefetch) {
+    // Timing is logged explicitly here (not inferred from getRelevantFactDescriptions's own
+    // internal logging) because that function's log lines don't know or say *why* they were
+    // called — this makes it possible to tell, from server logs alone, whether a prefetch
+    // actually finished before a user's first real request needed the cache it was meant to warm,
+    // rather than inferring it from the absence of an expected speedup.
+    const prefetchStartedAt = Date.now()
+    console.log(
+      `Prefetch warm-up started for user ${userId}, account ${account_id} at `
+      + `${new Date(prefetchStartedAt).toISOString()}`,
+    )
+    try {
+      await getRelevantFactDescriptions(userId, account_id, "warm cache", "warm cache")
+      console.log(
+        `Prefetch warm-up completed in ${Date.now() - prefetchStartedAt}ms for user ${userId}, `
+        + `account ${account_id}`,
+      )
+    } catch (err) {
+      // Best-effort only — the caller is fire-and-forget and isn't watching the result, so a
+      // failure here should never look like anything to it either way.
+      logError({
+        context: "POST.prefetch",
+        error: err,
+        userId,
+        accountId: account_id,
+        elapsedMs: Date.now() - prefetchStartedAt,
+      })
+    }
+    return Response.json({ ok: true })
+  }
 
   const dedupedHistory = dedupeConsecutive(conversation_history ?? [])
 
@@ -1312,6 +1527,17 @@ Summarize these results accurately.`,
               cacheText, embedding, responsePayload,
             )
           } catch (err) {
+            // Reaches the client via the SSE error event below (setError in InsightsPanel), but
+            // that alone isn't durable — nothing survives server-side without this.
+            logError({
+              context: "POST.prebuiltIntent.streamSynthesis",
+              error: err,
+              userId,
+              accountId: account_id,
+              question,
+              intent: finalIntent,
+              querySQL,
+            })
             controller.enqueue(
               encoder.encode(
                 `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
@@ -1330,7 +1556,15 @@ Summarize these results accurately.`,
         },
       })
     } catch (error) {
-      console.error("Query execution failed. SQL was:\n", querySQL, "\nError:", error)
+      logError({
+        context: "POST.prebuiltIntent.execute",
+        error,
+        userId,
+        accountId: account_id,
+        question,
+        intent: finalIntent,
+        querySQL,
+      })
       return Response.json(
         { error: "Query execution failed", detail: String(error) },
         { status: 500 },
@@ -1349,11 +1583,15 @@ Summarize these results accurately.`,
   // Builds contextual query text (recent user turns + current question) rather than reusing the
   // `embedding` already computed above for query_cache — that embedding is of the literal current
   // question only, which loses the topic when the current turn is a bare follow-up (e.g. "savings
-  // for the last seven days" after "how has my balance been lately"). Hard-timeout + degrade
-  // internally; never throws, never adds unbounded latency to a pipeline the voice advisor also
-  // depends on.
+  // for the last seven days" after "how has my balance been lately"). Passes the isolated question
+  // alongside it so the MIN-score check (see getRelevantFactDescriptions's doc comment) can tell a
+  // genuine continuation apart from an unrelated topic change that merely follows it in time.
+  // Hard-timeout + degrade internally; never throws, never adds unbounded latency to a pipeline
+  // the voice advisor also depends on.
+  const isolatedQuestionText = question ?? cacheText
   const relevantFacts = await getRelevantFactDescriptions(
-    userId, account_id, buildContextualQueryText(question ?? cacheText, dedupedHistory),
+    userId, account_id, isolatedQuestionText,
+    buildContextualQueryText(isolatedQuestionText, dedupedHistory),
   )
 
   let agentResult: AgentResult
@@ -1368,7 +1606,13 @@ Summarize these results accurately.`,
       relevantFacts,
     )
   } catch (error) {
-    console.error("Agent loop failed:", error)
+    logError({
+      context: "POST.runAgentLoop",
+      error,
+      userId,
+      accountId: account_id,
+      question,
+    })
     return Response.json(
       { error: "Query failed", detail: String(error) },
       { status: 500 },
@@ -1458,6 +1702,16 @@ Summarize these results accurately.`,
           cacheText, embedding, responsePayload,
         )
       } catch (err) {
+        // Reaches the client via the SSE error event below (setError in InsightsPanel), but
+        // that alone isn't durable — nothing survives server-side without this.
+        logError({
+          context: "POST.customQuery.streamSynthesis",
+          error: err,
+          userId,
+          accountId: account_id,
+          question,
+          querySQL,
+        })
         controller.enqueue(
           encoder.encode(
             `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`

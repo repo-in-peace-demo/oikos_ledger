@@ -99,6 +99,8 @@ If you want to start fresh as a guest:
 | CockroachDB tool #2 | Distributed Vector Indexing (semantic recall over past insights) |
 | AWS service | Lambda, Python 3.12 (scheduled batch distillation job) |
 
+**Note on MCP Server access control:** CockroachDB's Managed MCP Server scopes access at the whole-cluster Cloud RBAC level (the Cluster Operator role, in this project's case) for autonomous API-key connections — there is no platform-level mechanism to restrict a given connection to read-only, or to specific tables or operations. The read/write separation between this project's interactive path (read-only in practice) and its distillation path (read/write) is enforced in application code, not by the platform: the interactive path simply never issues write-shaped MCP tool calls (`insert_rows`, `create_table`, `create_database`). This is a deliberate, understood design choice given what the platform actually offers today, not an oversight.
+
 ---
 
 ## Developer setup

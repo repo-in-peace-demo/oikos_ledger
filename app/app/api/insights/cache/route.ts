@@ -1,6 +1,7 @@
 import { auth } from "@/auth"
 import { dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
+import { getTransactionsDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
 
 export const dynamic = "force-dynamic"
 
@@ -39,8 +40,22 @@ export async function POST(request: Request) {
       )
     }
 
+    const cached = result.rows[0].result as Record<string, unknown>
+    // Same freshness check as the exact-hash path in /api/insights/query — a suggestion clicked
+    // here goes straight to a raw cached result with no other staleness guard, so without this a
+    // stale suggestion (e.g. referencing a since-deleted transaction) would be servable
+    // indefinitely within its TTL. Reuses the same 404 shape as an expired/missing entry — the
+    // client's existing error handling for this endpoint already covers it.
+    const currentMarker = await getTransactionsDataMarkerOrUnknown(userId, account_id)
+    if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
+      return Response.json(
+        { error: "Cache entry not found or expired" },
+        { status: 404 },
+      )
+    }
+
     return Response.json({
-      ...(result.rows[0].result as Record<string, unknown>),
+      ...cached,
       cached: true,
     })
   } catch (error) {

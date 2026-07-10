@@ -109,6 +109,9 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
   const currentResponseId = useRef<string | null>(null)
   const mutedItemId = useRef<string | null>(null)
   const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([])
+  // Tracks which account_ids this mounted panel has already fired the prefetch warm-up for, so
+  // switching back and forth between accounts (or an unrelated re-render) doesn't re-fire it.
+  const prefetchedAccountIds = useRef<Set<string>>(new Set())
 
   // Scroll to bottom on new turns
   useEffect(() => {
@@ -118,6 +121,34 @@ export function InsightsPanel({ firstName }: InsightsPanelProps) {
   useEffect(() => {
     turnsRef.current = turns
   }, [turns])
+
+  // Fire-and-forget cache/cluster warm-up (see the prefetch branch in
+  // /api/insights/query/route.ts for the full rationale and its honest-scope caveat). Deliberately
+  // does not block render, show a loading state, or surface its result anywhere — this exists
+  // purely to move cold-start cost earlier than the user's first real question, on a best-effort
+  // basis only.
+  useEffect(() => {
+    if (!selectedAccountId) return
+    if (prefetchedAccountIds.current.has(selectedAccountId)) return
+    prefetchedAccountIds.current.add(selectedAccountId)
+
+    // Logged so it's observable (in the browser console, correlated against server logs by
+    // timestamp) whether this actually finished before the user's first real question fired —
+    // rather than inferred from whether that question happened to be fast or slow.
+    const firedAt = Date.now()
+    console.log(`[prefetch] fired for account ${selectedAccountId} at ${new Date(firedAt).toISOString()}`)
+    fetch("/api/insights/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prefetch: true, account_id: selectedAccountId }),
+    }).then(() => {
+      console.log(`[prefetch] completed for account ${selectedAccountId} in ${Date.now() - firedAt}ms`)
+    }).catch(() => {
+      // Best-effort only — nothing is watching this result, so a network failure here is not
+      // worth surfacing anywhere beyond this log.
+      console.log(`[prefetch] failed for account ${selectedAccountId} after ${Date.now() - firedAt}ms`)
+    })
+  }, [selectedAccountId])
 
   const disconnectVoice = useCallback(() => {
     if (transcriptTimer.current) {

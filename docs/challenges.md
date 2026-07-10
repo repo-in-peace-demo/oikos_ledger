@@ -225,3 +225,21 @@ network or security group misconfiguration at first glance.
 first, verify connectivity, then enable IAM authentication as a
 separate step. Do not rely on the default console wizard when
 both authentication modes are required.
+
+---
+
+## 15. CockroachDB Managed MCP Server — Intermittent Multi-Second Latency
+
+Occasional multi-second latency spikes were observed against the CockroachDB Managed MCP Server, affecting roughly 1 in 8 connection sessions in testing. The root cause was not conclusively isolated from client-side measurement alone.
+
+Two mechanisms were proposed and tested directly: query-plan caching (cost paid once per distinct SQL shape) and connection-layer warm-up (cost paid once per connection, any shape). A controlled test — running a candidate-fact query, then a structurally different query against a different table, then repeating the original query, all on one persistent warm connection, across 8 fresh-connection trials — ruled out both in their clean form. The effect was session-wide and binary: either all three calls in a trial were slow (~2.9–3.2s) or all three were fast (~0.7–0.9s), never a "slow first call, fast afterward" pattern that would implicate query shape or one-time connection cost specifically. This points to intermittent, whole-session latency variance (shared infrastructure contention, routing, or something else not visible from outside the service) rather than either proposed mechanism — but this remains unconfirmed, not just unconfirmed-and-assumed.
+
+**Mitigation:** A background prefetch fires on page load (Macro page and Insights panel) that populates the fact-similarity cache and, as a side effect, exercises the MCP connection ahead of the user's first real question. This reduces the odds of a slow session landing on that first question by moving the cost earlier — it does not guarantee elimination, since a slow session could still occur later in the same session regardless of whether the prefetch already ran.
+
+---
+
+## 16. HDFC Value Date vs. Posting Date Crossing a Month Boundary
+
+Bank statement exports may include transactions whose value date falls in a different month than the statement period they're delivered in. Observed case: an HDFC interest credit with a June value date posted into the July statement file.
+
+This is not currently handled — treated as a bank-specific export quirk rather than a pipeline bug, since the transaction is correctly parsed and recorded, just under the statement period it was actually delivered in rather than the period its value date implies.

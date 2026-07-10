@@ -1,5 +1,6 @@
 "use client"
 
+import { useEffect, useRef } from "react"
 import { useMacro } from "@/lib/hooks/useMacro"
 import { formatCurrency } from "@/lib/currency"
 import { InvestmentScenarioSlider } from "./InvestmentScenarioSlider"
@@ -40,6 +41,35 @@ export function MacroPanel() {
   const hasIndicators = indicators.length > 0
   const hasRealityContent = hasBalanceInfo || (hasIndicators && !!explanation)
   const inflationIndicator = indicators.find((i) => i.indicator === "inflation")
+
+  // Fire-and-forget cache/cluster warm-up (see the prefetch branch in
+  // /api/insights/query/route.ts for the full rationale and its honest-scope caveat). Macro
+  // aggregates across all of a user's accounts rather than having one "selected" account like
+  // Insights does, so this fires once per account_id it knows about, from the balances this page
+  // already fetched — not a new lookup. Deliberately does not block render, show a loading state,
+  // or surface its result anywhere.
+  const prefetchedAccountIds = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    for (const account of balances.accounts) {
+      if (prefetchedAccountIds.current.has(account.account_id)) continue
+      prefetchedAccountIds.current.add(account.account_id)
+
+      // Logged so it's observable (in the browser console, correlated against server logs by
+      // timestamp) whether this actually finished before the user's first real question fired.
+      const firedAt = Date.now()
+      console.log(`[prefetch] fired for account ${account.account_id} at ${new Date(firedAt).toISOString()}`)
+      fetch("/api/insights/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefetch: true, account_id: account.account_id }),
+      }).then(() => {
+        console.log(`[prefetch] completed for account ${account.account_id} in ${Date.now() - firedAt}ms`)
+      }).catch(() => {
+        // Best-effort only — nothing is watching this result beyond this log.
+        console.log(`[prefetch] failed for account ${account.account_id} after ${Date.now() - firedAt}ms`)
+      })
+    }
+  }, [balances.accounts])
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden">
