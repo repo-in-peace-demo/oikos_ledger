@@ -33,7 +33,15 @@ ACCOUNT_CATEGORY_BASELINE_FACT_TYPE = "category_baseline"
 # macro_explanation episodic_event, and this job reads that history back to detect trends.
 BALANCE_TREND_FACT_TYPE = "trend:balance_snapshot"
 
-FactKey = tuple[str, str | None, str, str | None]  # (user_id, account_id, fact_type, category)
+# Account-pair spending comparison (see app/components/analytics/ComparePanel.tsx and
+# app/app/api/accounts/compare/route.ts). account_id/compared_account_id are real columns on
+# semantic_facts — see ingestion/models/memory.py — not string-encoded, same reasoning that
+# already replaced the old `category_baseline::<account_id>` convention.
+COMPARISON_SNAPSHOT_FACT_TYPE = "trend:comparison_snapshot"
+
+# (user_id, account_id, compared_account_id, fact_type, category). compared_account_id is None
+# for every fact_type except trend:comparison_snapshot.
+FactKey = tuple[str, str | None, str | None, str, str | None]
 
 
 def fetch_recent_events(session: Session, since: datetime) -> list[EpisodicEvent]:
@@ -96,18 +104,25 @@ def _get_active_fact(
     account_id: str | None,
     fact_type: str,
     category: str | None,
+    compared_account_id: str | None = None,
 ) -> SemanticFact | None:
     """Look up the current active fact for this key. This lookup-then-decide step is also what
     protects the account_id IS NULL case: the partial unique index on semantic_facts cannot catch
     duplicate NULL-account_id rows (Postgres/CockroachDB never treat two NULLs as equal for
     uniqueness), so this application-level check is the only thing preventing user-level facts
     from silently duplicating. See ingestion/models/memory.py for the full explanation of why a
-    sentinel "no account" UUID isn't used instead.
+    sentinel "no account" UUID isn't used instead. Same NULL-safe pattern applied to
+    compared_account_id, which is only ever non-None for trend:comparison_snapshot facts.
     """
     account_filter = SemanticFact.account_id.is_(None) if account_id is None else SemanticFact.account_id == account_id
+    compared_filter = (
+        SemanticFact.compared_account_id.is_(None) if compared_account_id is None
+        else SemanticFact.compared_account_id == compared_account_id
+    )
     stmt = select(SemanticFact).where(
         SemanticFact.user_id == user_id,
         account_filter,
+        compared_filter,
         SemanticFact.fact_type == fact_type,
         SemanticFact.category == category,
         SemanticFact.superseded_by.is_(None),
@@ -124,18 +139,20 @@ def upsert_or_supersede_fact(
     description: str,
     running_mean: float,
     occurrence_count: int,
+    compared_account_id: str | None = None,
 ) -> SemanticFact:
     """Write a trend/percentile fact. Identical values are bumped in place (cheap); a materially
     different value supersedes the old row instead of overwriting it, per the memory design.
     """
     now = datetime.now(timezone.utc)
     confidence_status = "confirmed" if occurrence_count >= settings.min_occurrences_for_trend else "tentative"
-    existing = _get_active_fact(session, user_id, account_id, fact_type, category)
+    existing = _get_active_fact(session, user_id, account_id, fact_type, category, compared_account_id)
 
     if existing is None:
         fact = SemanticFact(
             user_id=user_id,
             account_id=account_id,
+            compared_account_id=compared_account_id,
             fact_type=fact_type,
             category=category,
             description=description,
@@ -167,6 +184,7 @@ def upsert_or_supersede_fact(
     superseding_fact = SemanticFact(
         user_id=user_id,
         account_id=account_id,
+        compared_account_id=compared_account_id,
         fact_type=fact_type,
         category=category,
         description=description,
@@ -177,6 +195,20 @@ def upsert_or_supersede_fact(
         relevance_score=1.0,
         last_accessed_at=now,
     )
+
+    # The partial unique index (uq_semantic_facts_user_fact_category_active) only applies WHERE
+    # superseded_by IS NULL — inserting superseding_fact (same user/account/compared_account/
+    # fact_type/category key) while `existing` still has superseded_by NULL means both rows would
+    # briefly satisfy that predicate at once, which CockroachDB rejects synchronously (not
+    # deferred to commit): "duplicate key value violates unique constraint". So `existing` has to
+    # stop being active *before* the new row is inserted, not after. It doesn't have
+    # superseding_fact's id yet at this point — self-reference temporarily (a valid FK target,
+    # since the row already exists) purely to clear the NULL and free the slot, then overwrite
+    # with the real forward pointer once superseding_fact has an id.
+    existing.superseded_by = existing.id
+    session.add(existing)
+    session.flush()
+
     session.add(superseding_fact)
     session.flush()  # need superseding_fact.id before pointing the old row at it
 
@@ -217,27 +249,54 @@ def run_trend_and_percentile_pass(session: Session, events: list[EpisodicEvent])
             running_mean=stats["mean"],
             occurrence_count=stats["occurrence_count"],
         )
-        touched.add((user_id, account_id, fact_type, category))
+        touched.add((user_id, account_id, None, fact_type, category))
 
     return touched
 
 
-def _extract_balance_snapshots(events: list[EpisodicEvent]) -> list[tuple[datetime, float]]:
-    """Chronological (created_at, combined_balance) pairs from one user's macro_explanation
-    events — only events whose metadata actually carried a usable numeric balance.
+def _extract_balance_snapshots(
+    events: list[EpisodicEvent],
+) -> list[tuple[datetime, float, frozenset[str] | None]]:
+    """Chronological (created_at, combined_balance, account_ids) triples from one user's
+    macro_explanation events — only events whose metadata actually carried a usable numeric
+    balance. account_ids is the frozenset of account_ids that contributed to combined_balance at
+    that snapshot (see app/app/api/macro/route.ts), or None if the event predates that field —
+    used to detect a genuine change in which accounts are being combined (e.g. a second account
+    added), separately from a change in the resulting balance number. See
+    _classify_balance_steps/describe_balance_trend.
     """
-    dated = [
-        (e.created_at, float(e.metadata_["combined_balance"]))  # type: ignore[index]
-        for e in events
-        if isinstance((e.metadata_ or {}).get("combined_balance"), (int, float))
-    ]
-    return sorted(dated, key=lambda pair: pair[0])
+    dated: list[tuple[datetime, float, frozenset[str] | None]] = []
+    for e in events:
+        metadata = e.metadata_ or {}
+        balance = metadata.get("combined_balance")
+        if not isinstance(balance, (int, float)):
+            continue
+        raw_account_ids = metadata.get("account_ids")
+        account_ids = (
+            frozenset(str(a) for a in raw_account_ids)
+            if isinstance(raw_account_ids, list)
+            else None
+        )
+        dated.append((e.created_at, float(balance), account_ids))
+    return sorted(dated, key=lambda triple: triple[0])
 
 
-def _classify_balance_steps(snapshots: list[tuple[datetime, float]]) -> list[str]:
-    """One "flat" | "down" | "up" label per consecutive pair of snapshots."""
+def _classify_balance_steps(
+    snapshots: list[tuple[datetime, float, frozenset[str] | None]],
+) -> list[str]:
+    """One "flat" | "down" | "up" | "account_set_changed" label per consecutive pair of
+    snapshots. "account_set_changed" wins over the numeric comparison entirely — a jump caused by
+    a newly-tracked account isn't a balance trend step at all, so no percentage is computed for
+    it. Only fires when BOTH snapshots have a known account_ids set and they actually differ — an
+    unknown set (an event recorded before this field existed) is treated as unchanged, the same
+    conservative default as before this field existed, rather than risk masking a genuine trend
+    off incomplete old data.
+    """
     steps = []
-    for (_, prev), (_, curr) in zip(snapshots, snapshots[1:]):
+    for (_, prev, prev_accounts), (_, curr, curr_accounts) in zip(snapshots, snapshots[1:]):
+        if prev_accounts is not None and curr_accounts is not None and prev_accounts != curr_accounts:
+            steps.append("account_set_changed")
+            continue
         if prev == 0:
             steps.append("flat")
             continue
@@ -265,16 +324,32 @@ def _format_elapsed_duration(elapsed: timedelta) -> str:
     return f"about {months} month{'' if months == 1 else 's'}"
 
 
-def describe_balance_trend(snapshots: list[tuple[datetime, float]]) -> tuple[str, int] | None:
+def describe_balance_trend(
+    snapshots: list[tuple[datetime, float, frozenset[str] | None]],
+) -> tuple[str, int] | None:
     """Describe the trailing run of agreeing steps (flat/down/up) at the end of the snapshot
     history. A single reversal ends the run, so this never confirms a trend off one data point —
     the run naturally requires at least two snapshots (one step) to exist at all, and the
     resulting occurrence_count feeds the same confirmed/tentative threshold as every other fact.
     Returns (description, occurrence_count), or None if there's no direction to report yet.
+
+    If the account set changed between the two most recent snapshots (e.g. a second account
+    added), that's not a trend step — no percentage is computed, and the prior run is not
+    continued. The latest snapshot becomes occurrence 1 of a fresh trend instead, same as a
+    genuinely first-ever snapshot would be, with a description naming what actually happened
+    rather than a misleading "balance jumped/declined by X%" narration.
     """
     steps = _classify_balance_steps(snapshots)
     if not steps:
         return None  # fewer than 2 snapshots — nothing to compare yet
+
+    if steps[-1] == "account_set_changed":
+        latest_balance = snapshots[-1][1]
+        description = (
+            "Started tracking a new account — balance trend will resume from here "
+            f"(combined balance now ₹{round(latest_balance):,})."
+        )
+        return description, 1
 
     direction = steps[-1]
     run_length = 1
@@ -334,7 +409,153 @@ def run_balance_trend_pass(session: Session, macro_events: list[EpisodicEvent]) 
             running_mean=snapshots[-1][1],
             occurrence_count=occurrence_count,
         )
-        touched.add((user_id, None, BALANCE_TREND_FACT_TYPE, None))
+        touched.add((user_id, None, None, BALANCE_TREND_FACT_TYPE, None))
+
+    return touched
+
+
+def fetch_comparison_run_events(session: Session, since: datetime) -> list[EpisodicEvent]:
+    stmt = select(EpisodicEvent).where(
+        EpisodicEvent.event_type == "comparison_run",
+        EpisodicEvent.created_at >= since,
+    )
+    return list(session.exec(stmt))
+
+
+def _extract_comparison_pairs(
+    comparison_events: list[EpisodicEvent],
+) -> dict[tuple[str, str, str], dict[str, str]]:
+    """Distinct (user_id, account_a, account_b) pairs actually compared via the Compare feature —
+    account_a < account_b (string comparison) so the pair key is stable regardless of which order
+    the user selected the two accounts in, sourced from comparison_run events' metadata
+    (account_ids, account_labels — see app/app/api/accounts/compare/route.ts), not synthesized
+    from every possible pair of a user's accounts. Returns pair -> {account_id: label}, merging
+    labels across every event that carried them — an event from before account_labels was added
+    to that route won't have any, so later events fill the gap.
+    """
+    pairs: dict[tuple[str, str, str], dict[str, str]] = {}
+    for event in comparison_events:
+        metadata = event.metadata_ or {}
+        account_ids = metadata.get("account_ids")
+        labels = metadata.get("account_labels") or {}
+        if not isinstance(account_ids, list) or len(account_ids) < 2:
+            continue
+        user_id = str(event.user_id)
+        for i in range(len(account_ids)):
+            for j in range(i + 1, len(account_ids)):
+                a, b = sorted([str(account_ids[i]), str(account_ids[j])])
+                merged = pairs.setdefault((user_id, a, b), {})
+                for account_id in (a, b):
+                    if account_id in labels:
+                        merged[account_id] = labels[account_id]
+    return pairs
+
+
+def _get_confirmed_category_baselines(
+    session: Session, user_id: str, account_id: str,
+) -> dict[str, SemanticFact]:
+    """Active, confirmed category_baseline facts for one account, keyed by category. Only
+    confirmed facts participate in a comparison — an unconfirmed baseline isn't solid enough
+    evidence to compare against another account's yet.
+    """
+    stmt = select(SemanticFact).where(
+        SemanticFact.user_id == user_id,
+        SemanticFact.account_id == account_id,
+        SemanticFact.fact_type == ACCOUNT_CATEGORY_BASELINE_FACT_TYPE,
+        SemanticFact.confidence_status == "confirmed",
+        SemanticFact.superseded_by.is_(None),
+    )
+    return {fact.category: fact for fact in session.exec(stmt) if fact.category}
+
+
+def describe_comparison_snapshot(
+    account_label: str,
+    compared_label: str,
+    category: str,
+    delta: float,
+    prior_delta: float | None,
+    prior_run_length: int,
+) -> tuple[str, int]:
+    """delta = account_id's category mean minus compared_account_id's category mean, always
+    computed in that fixed order regardless of who's currently higher — account_id/
+    compared_account_id are a stable, canonical pair key (see _extract_comparison_pairs), never
+    reassigned to whoever's winning, so the same fact row can be superseded across a flip instead
+    of silently keying to a brand new row that the old one never gets linked to.
+
+    Run length increments only if the *sign* of delta agrees with the previous check's delta
+    (same account still higher) — a sign flip means the relationship reversed, so the run resets
+    to 1 rather than continuing to count through a reversal. Mirrors describe_balance_trend's
+    same-direction run-length logic, applied to "which account is higher" instead of "balance
+    direction". Returns (description, occurrence_count).
+    """
+    if prior_delta is not None and prior_delta != 0 and (delta > 0) == (prior_delta > 0):
+        run_length = prior_run_length + 1
+    else:
+        run_length = 1
+
+    higher_label, lower_label = (
+        (account_label, compared_label) if delta >= 0 else (compared_label, account_label)
+    )
+    check_word = "check" if run_length == 1 else "checks"
+    description = (
+        f"{higher_label} has run higher than {lower_label} in {category} spending "
+        f"for {run_length} consecutive {check_word}."
+    )
+    return description, run_length
+
+
+def run_comparison_snapshot_pass(
+    session: Session,
+    comparison_events: list[EpisodicEvent],
+) -> set[FactKey]:
+    """Per (user, account pair) actually compared via the Compare feature (not every possible pair
+    of a user's accounts — only ones evidenced by a comparison_run event), compare confirmed
+    category_baseline facts shared by both accounts and track which account has run higher in
+    that category across consecutive distillation checks. Skips a category entirely if either
+    account doesn't have a confirmed baseline for it yet — nothing solid enough to compare.
+    """
+    touched: set[FactKey] = set()
+    pairs = _extract_comparison_pairs(comparison_events)
+
+    for (user_id, account_a, account_b), labels in pairs.items():
+        label_a = labels.get(account_a, account_a)
+        label_b = labels.get(account_b, account_b)
+
+        baselines_a = _get_confirmed_category_baselines(session, user_id, account_a)
+        baselines_b = _get_confirmed_category_baselines(session, user_id, account_b)
+        shared_categories = set(baselines_a) & set(baselines_b)
+
+        for category in shared_categories:
+            fact_a = baselines_a[category]
+            fact_b = baselines_b[category]
+            if fact_a.running_mean is None or fact_b.running_mean is None:
+                continue  # confirmed but no mean recorded — shouldn't happen, nothing to compare
+
+            delta = fact_a.running_mean - fact_b.running_mean
+
+            existing = _get_active_fact(
+                session, user_id, account_a, COMPARISON_SNAPSHOT_FACT_TYPE, category,
+                compared_account_id=account_b,
+            )
+            prior_delta = existing.running_mean if existing else None
+            prior_run_length = existing.occurrence_count if existing else 0
+
+            description, run_length = describe_comparison_snapshot(
+                label_a, label_b, category, delta, prior_delta, prior_run_length,
+            )
+
+            upsert_or_supersede_fact(
+                session,
+                user_id=user_id,
+                account_id=account_a,
+                fact_type=COMPARISON_SNAPSHOT_FACT_TYPE,
+                category=category,
+                description=description,
+                running_mean=delta,
+                occurrence_count=run_length,
+                compared_account_id=account_b,
+            )
+            touched.add((user_id, account_a, account_b, COMPARISON_SNAPSHOT_FACT_TYPE, category))
 
     return touched
 
@@ -354,6 +575,7 @@ def run_decay_pass(session: Session, touched: set[FactKey]) -> int:
         key: FactKey = (
             str(fact.user_id),
             str(fact.account_id) if fact.account_id else None,
+            str(fact.compared_account_id) if fact.compared_account_id else None,
             fact.fact_type,
             fact.category,
         )
@@ -367,8 +589,8 @@ def run_decay_pass(session: Session, touched: set[FactKey]) -> int:
 
 
 def run_distillation() -> dict[str, int]:
-    """Entry point — fetch recent episodic_events, distill trends/percentiles/balance snapshots,
-    then decay.
+    """Entry point — fetch recent episodic_events, distill trends/percentiles/balance snapshots/
+    comparison snapshots, then decay.
     """
     from distillation.db.client import get_session
 
@@ -382,10 +604,16 @@ def run_distillation() -> dict[str, int]:
         macro_events = fetch_macro_explanation_events(session, balance_since)
         touched |= run_balance_trend_pass(session, macro_events)
 
+        # comparison_run events happen whenever a user visits Compare — occasional/on-demand, same
+        # cadence concern as macro_explanation, so this reuses the same long lookback rather than
+        # the generic 7-day distill_lookback_days (which would miss most runs).
+        comparison_events = fetch_comparison_run_events(session, balance_since)
+        touched |= run_comparison_snapshot_pass(session, comparison_events)
+
         decayed_count = run_decay_pass(session, touched)
 
     summary = {
-        "events_scanned": len(events) + len(macro_events),
+        "events_scanned": len(events) + len(macro_events) + len(comparison_events),
         "facts_touched": len(touched),
         "facts_decayed": decayed_count,
     }

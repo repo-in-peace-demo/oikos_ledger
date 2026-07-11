@@ -2,6 +2,8 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
+from ..categorizer import categorize_transaction
+from ..normalizer import detect_subcategory
 from .base import BaseCSVParser, NarrationResult, ParsedRow, SkippedRow
 
 
@@ -31,9 +33,19 @@ class AxisParser(BaseCSVParser):
         "INT.PD": ("Other", "Interest"),
     }
 
+    # Prefixes whose category is a guess, not a certainty, unlike ATM-CASH-AXIS (always an ATM
+    # withdrawal) or INB (always a transfer) — the merchant behind a card swipe could be a
+    # grocer, a pharmacy, a clothing store, anything. normalize_narration below routes these
+    # through the same deterministic keyword scorer + subcategory detection HDFC's parser uses
+    # (categorize_transaction/detect_subcategory) instead of trusting SLASH_PATTERNS' category
+    # outright, and only falls back to it if that lookup genuinely finds nothing.
+    CATEGORY_UNCERTAIN_PREFIXES = frozenset({"POS", "PUR"})
+
     # Slash-pattern narrations — extracted deterministically
     # Format: {PREFIX}/{SEGMENT1}/{MERCHANT_OR_INFO}/...
     # merchant_segment_index: position of merchant in slash parts (-1 = last non-empty)
+    # category here is a default — for CATEGORY_UNCERTAIN_PREFIXES it's only used as a fallback,
+    # not returned outright; see normalize_narration.
     SLASH_PATTERNS: dict[str, tuple[str, str, int]] = {
         "ATM-CASH-AXIS": ("ATM", "ATM Withdrawal", -1),
         "INB": ("NEFT", "Transfer", 2),
@@ -104,19 +116,56 @@ class AxisParser(BaseCSVParser):
         upper = narration.upper().strip()
 
         # Step 1: slash pattern detection — longest prefix first
-        for prefix, (payment_method, category, merchant_idx) in sorted(
+        for prefix, (payment_method, default_category, merchant_idx) in sorted(
             self.SLASH_PATTERNS.items(),
             key=lambda x: len(x[0]),
             reverse=True,
         ):
             if upper.startswith(prefix.upper() + "/"):
                 merchant = self._extract_slash_merchant(narration, merchant_idx)
+
+                if merchant is None:
+                    # No merchant to categorize against either way — always defer to the
+                    # registry/LLM path regardless of prefix.
+                    return NarrationResult(
+                        merchant=prefix.title(),
+                        payment_method=payment_method,
+                        category=default_category,
+                        subcategory=None,
+                        needs_llm=True,
+                    )
+
+                if prefix not in self.CATEGORY_UNCERTAIN_PREFIXES:
+                    # ATM-CASH-AXIS, INB — the category really is certain from the prefix alone.
+                    return NarrationResult(
+                        merchant=merchant,
+                        payment_method=payment_method,
+                        category=default_category,
+                        subcategory=None,
+                        needs_llm=False,
+                    )
+
+                # POS/PUR — a card swipe's category depends entirely on which merchant is behind
+                # it, so the prefix's own default is a fallback, not a first guess. Run the same
+                # deterministic keyword scorer + subcategory detection HDFC's parser relies on
+                # (both pure functions — no registry/DB/LLM access from here, this stays sync).
+                scored_category = categorize_transaction(narration, merchant, payment_method)
+                subcategory, subcategory_override = detect_subcategory(merchant, narration)
+                genuine_category = subcategory_override or (
+                    scored_category if scored_category != "Other" else None
+                )
+
                 return NarrationResult(
-                    merchant=merchant or prefix.title(),
+                    merchant=merchant,
                     payment_method=payment_method,
-                    category=category,
-                    subcategory=None,
-                    needs_llm=merchant is None,
+                    category=genuine_category or default_category,
+                    subcategory=subcategory,
+                    # A genuine match found deterministically needs no further refinement. No
+                    # match (category falls back to the static default here) means this is
+                    # exactly as uncertain as a cleanly-extracted HDFC merchant with no keyword
+                    # hit — eligible for the merchant-registry/LLM path in normalize_with_llm,
+                    # not silently accepted as "Shopping".
+                    needs_llm=genuine_category is None,
                 )
 
         # Step 2: axis narration code detection — longest first

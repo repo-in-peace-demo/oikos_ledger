@@ -4,7 +4,7 @@
 
 Three-column layout rendered inside `app/(dashboard)/layout.tsx`:
 
-1. **Nav sidebar** — icon-only (56px), tooltips on hover. Nav items: Dashboard, Insights, Recommendations, Analytics. Macro Context item rendered but disabled (reduced opacity, not clickable).
+1. **Nav sidebar** — icon-only (56px), tooltips on hover. Nav items: Dashboard, Insights, Recommendations, Analytics, Compare, Macro Context.
 2. **Accounts panel** — 220px fixed, lists bank accounts for the authenticated user
 3. **Main panel** — `flex-1`, fills remaining space (transactions, insights, recommendations, or analytics)
 

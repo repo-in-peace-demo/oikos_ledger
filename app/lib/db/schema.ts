@@ -199,7 +199,7 @@ export const episodic_events = pgTable("episodic_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   user_id: uuid("user_id").notNull().references(() => users.id),
   account_id: uuid("account_id").references(() => bank_accounts.id),
-  event_type: text("event_type").notNull(), // macro_explanation | insight_shown | comparison_run | ...
+  event_type: text("event_type").notNull(), // macro_explanation | insight_shown | comparison_run | category_spend_snapshot | ...
   content: text("content").notNull(),
   embedding: vector("embedding", { dimensions: 1536 }).notNull(),
   metadata: json("metadata").$type<Record<string, unknown>>(),
@@ -215,6 +215,11 @@ export const semantic_facts = pgTable("semantic_facts", {
   // Deliberately kept nullable rather than a sentinel "no account" UUID — see the NULL-uniqueness
   // caveat on the index below, and ingestion/models/memory.py for the full explanation.
   account_id: uuid("account_id").references(() => bank_accounts.id),
+  // Populated only for trend:comparison_snapshot facts — the other account in the pair being
+  // compared. NULL for every other fact_type, same nullable-FK pattern as account_id above. A
+  // real column, not string-encoded into category — same reasoning that already replaced the old
+  // `category_baseline::<account_id>` convention.
+  compared_account_id: uuid("compared_account_id").references(() => bank_accounts.id),
   fact_type: text("fact_type").notNull(),
   category: text("category"),
   description: text("description").notNull(),
@@ -238,7 +243,7 @@ export const semantic_facts = pgTable("semantic_facts", {
   // detailed comment in ingestion/models/memory.py (the authoritative definition; create_tables.py
   // owns migrations).
   uqUserFactCategoryActive: uniqueIndex("uq_semantic_facts_user_fact_category_active")
-    .on(table.user_id, table.account_id, table.fact_type, table.category)
+    .on(table.user_id, table.account_id, table.compared_account_id, table.fact_type, table.category)
     .where(sql`superseded_by IS NULL`),
 }));
 

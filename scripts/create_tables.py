@@ -77,21 +77,47 @@ def main() -> None:
                 FOREIGN KEY (account_id) REFERENCES bank_accounts(id)
             """))
 
-        # Only one *active* fact per (user_id, account_id, fact_type, category). The distillation
-        # job supersedes a fact by inserting a new row and pointing the old row's superseded_by
-        # at it, rather than updating in place — so the uniqueness constraint must be partial
-        # (superseded_by IS NULL), not a plain unique index.
+        # compared_account_id: the second account in a trend:comparison_snapshot fact (a
+        # comparison relates two accounts, not one — same reasoning that replaced the old
+        # `category_baseline::<account_id>` string-encoding with the account_id column itself).
+        # NULL for every other fact_type. Same existence-checked FK pattern as account_id above,
+        # for the same reason: ADD COLUMN IF NOT EXISTS only guards the column, not an inline
+        # REFERENCES clause.
+        session.exec(text("""
+            ALTER TABLE semantic_facts ADD COLUMN IF NOT EXISTS compared_account_id UUID
+        """))
+
+        existing_compared_fk = session.exec(text("""
+            SELECT constraint_name FROM information_schema.table_constraints
+            WHERE table_name = 'semantic_facts'
+              AND constraint_type = 'FOREIGN KEY'
+              AND constraint_name = 'semantic_facts_compared_account_id_fkey'
+        """)).first()
+
+        if existing_compared_fk is None:
+            session.exec(text("""
+                ALTER TABLE semantic_facts
+                ADD CONSTRAINT semantic_facts_compared_account_id_fkey
+                FOREIGN KEY (compared_account_id) REFERENCES bank_accounts(id)
+            """))
+
+        # Only one *active* fact per (user_id, account_id, compared_account_id, fact_type,
+        # category). The distillation job supersedes a fact by inserting a new row and pointing
+        # the old row's superseded_by at it, rather than updating in place — so the uniqueness
+        # constraint must be partial (superseded_by IS NULL), not a plain unique index.
         #
         # NULL-uniqueness caveat: two user-level rows (account_id IS NULL) with the same
         # user_id/fact_type/category will NOT collide on this index — Postgres/CockroachDB never
         # treat two NULLs as equal for uniqueness. This is handled at the application level in
         # distillation/pipeline/distiller.py (upsert_or_supersede_fact looks up the existing
-        # active row, matching NULL account_id with `.is_(None)`, before deciding to insert),
-        # not with a sentinel "no account" value — see ingestion/models/memory.py for why a
-        # sentinel doesn't work here (it would break the account_id foreign key).
-        # Drop both possible prior names: the original plain index (still live as of this
-        # writing) and the intermediate partial-without-account_id name, in case that
-        # intermediate migration was ever applied elsewhere.
+        # active row, matching NULL account_id/compared_account_id with `.is_(None)`, before
+        # deciding to insert), not with a sentinel "no account" value — see
+        # ingestion/models/memory.py for why a sentinel doesn't work here (it would break the
+        # account_id/compared_account_id foreign keys).
+        # Drop all possible prior names: the original plain index, the intermediate
+        # partial-without-account_id name, and the partial-with-account_id-but-not-
+        # compared_account_id name this script created before tonight, in case any of those
+        # migrations was ever applied elsewhere.
         session.exec(text("""
             DROP INDEX IF EXISTS uq_semantic_facts_user_fact_category CASCADE
         """))
@@ -101,7 +127,7 @@ def main() -> None:
 
         session.exec(text("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_semantic_facts_user_fact_category_active
-            ON semantic_facts (user_id, account_id, fact_type, category)
+            ON semantic_facts (user_id, account_id, compared_account_id, fact_type, category)
             WHERE superseded_by IS NULL
         """))
 

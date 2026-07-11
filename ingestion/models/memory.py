@@ -19,7 +19,7 @@ class EpisodicEvent(SQLModel, table=True):
     )
     user_id: uuid.UUID = Field(foreign_key="users.id")
     account_id: Optional[uuid.UUID] = Field(default=None, foreign_key="bank_accounts.id")
-    event_type: str  # macro_explanation | insight_shown | comparison_run | ...
+    event_type: str  # macro_explanation | insight_shown | comparison_run | category_spend_snapshot | ...
     content: str
     embedding: List[float] = Field(
         sa_column=Column("embedding", Vector(1536), nullable=False),
@@ -47,8 +47,15 @@ class SemanticFact(SQLModel, table=True):
         # Partial unique index, not a plain UniqueConstraint — supersession (see the
         # distillation job) inserts a new row and points the old row's superseded_by
         # at it rather than updating in place, so multiple rows can share a
-        # (user_id, account_id, fact_type, category) key as long as only one is still
-        # active (superseded_by IS NULL).
+        # (user_id, account_id, compared_account_id, fact_type, category) key as long as only one
+        # is still active (superseded_by IS NULL).
+        #
+        # compared_account_id is a real column, not string-encoded into category — a comparison
+        # fact (trend:comparison_snapshot) relates two accounts, not one, same reasoning that
+        # already replaced the old `category_baseline::<account_id>` convention with the
+        # account_id column itself. NULL for every other fact_type; both account_id and
+        # compared_account_id are populated (never NULL) specifically for comparison facts, since
+        # the fact is about that exact pair.
         #
         # NULL-uniqueness caveat: Postgres/CockroachDB never treat two NULLs as equal for
         # uniqueness, so two user-level rows (account_id IS NULL, same user/fact_type/category)
@@ -58,13 +65,13 @@ class SemanticFact(SQLModel, table=True):
         # bank_accounts (which would then leak into every "list this user's accounts" query) or
         # drop the FK entirely. Instead, true NULL is kept and the distillation job's
         # upsert_or_supersede_fact() explicitly looks up the existing active row (matching NULL
-        # account_id with `.is_(None)`) before deciding to insert — see
+        # account_id/compared_account_id with `.is_(None)`) before deciding to insert — see
         # distillation/pipeline/distiller.py. That job is the only writer of semantic_facts and
         # runs as a single scheduled Lambda invocation, so the check-then-insert race this
         # implies is a deliberately accepted, low-probability residual risk, not an oversight.
         Index(
             "uq_semantic_facts_user_fact_category_active",
-            "user_id", "account_id", "fact_type", "category",
+            "user_id", "account_id", "compared_account_id", "fact_type", "category",
             unique=True,
             postgresql_where=text("superseded_by IS NULL"),
         ),
@@ -79,6 +86,9 @@ class SemanticFact(SQLModel, table=True):
     # Non-NULL = account-specific fact (e.g. Compare-feature per-account category baselines).
     # See the NULL-uniqueness caveat on __table_args__ above before changing this to a sentinel.
     account_id: Optional[uuid.UUID] = Field(default=None, foreign_key="bank_accounts.id")
+    # Populated only for trend:comparison_snapshot facts — the other account in the pair being
+    # compared. NULL for every other fact_type, same nullable-FK pattern as account_id above.
+    compared_account_id: Optional[uuid.UUID] = Field(default=None, foreign_key="bank_accounts.id")
     fact_type: str
     category: Optional[str] = Field(default=None)
     description: str

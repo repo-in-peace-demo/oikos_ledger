@@ -247,7 +247,13 @@ async function buildBalancesSummary(userId: string): Promise<BalancesSummary> {
       return balance
         ? {
             account_id: account.id,
-            label: account.account_nickname ?? account.bank_name,
+            // bank_name always shown — account_nickname alone isn't reliable for distinguishing
+            // accounts (e.g. two accounts both left at a shared default nickname like "Primary"
+            // would otherwise render identically here). Nickname is still surfaced, just
+            // alongside the bank name rather than instead of it.
+            label: account.account_nickname
+              ? `${account.bank_name} (${account.account_nickname})`
+              : account.bank_name,
             closing_balance: balance.closing_balance,
             as_of_month: balance.as_of_month,
           }
@@ -402,11 +408,19 @@ export async function GET() {
         // trends without needing its own DB grant on bank_accounts/transactions — it only has
         // SELECT on episodic_events, so this is the only way it can see balance history at all.
         // See distillation/pipeline/distiller.py's BALANCE_TREND_FACT_TYPE.
+        //
+        // account_ids — sorted so the distillation job can detect a genuine change in which
+        // accounts make up combined_balance, separately from a change in the resulting number.
+        // Whenever combined_balance is non-null, every account in balances.accounts contributed
+        // to it (buildBalancesSummary forces state to "not_blended" — combined_balance null — the
+        // moment any single account would need excluding), so this is exactly the contributing
+        // set, not an approximation.
         metadata: {
           explanation_key: explanationKey,
           combined_balance: balances.combined_balance,
           balance_state: balances.state,
           reference_month: balances.reference_month,
+          account_ids: balances.accounts.map((a) => a.account_id).sort(),
         },
       })
     } catch (err) {

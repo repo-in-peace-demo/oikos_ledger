@@ -3,13 +3,14 @@
 import { useState, useRef, useEffect } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { BarChart2, Globe, LayoutDashboard, Lightbulb, Sparkles, LogOut } from "lucide-react"
+import { BarChart2, GitCompare, Globe, LayoutDashboard, Lightbulb, Sparkles, LogOut } from "lucide-react"
 
 const NAV_ITEMS: { href: string; label: string; icon: React.ElementType; disabled?: boolean }[] = [
   { href: "/", label: "Transactions", icon: LayoutDashboard },
   { href: "/insights", label: "Insights", icon: Lightbulb },
   { href: "/recommendations", label: "Recommendations", icon: Sparkles },
   { href: "/analytics", label: "Analytics", icon: BarChart2 },
+  { href: "/compare", label: "Compare", icon: GitCompare },
   { href: "/macro", label: "Macro Context", icon: Globe },
 ]
 

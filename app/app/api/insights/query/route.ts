@@ -38,45 +38,21 @@ const FACT_SIMILARITY_LIMIT = 3
 // budget in production. Going forward, each budget below is sized against the worst latency
 // actually observed for that specific call shape, with real multiplicative margin over it — not
 // "just above the one number seen so far" — and the evidence for each number is stated inline
-// rather than left as a bare constant. Where that's not fully achievable (see FACT_MISS_TIMEOUT_MS
-// below) it's flagged explicitly as a judgment call, not silently under-margined again.
+// rather than left as a bare constant.
 
-// Facts freshness marker check — a direct-SQL (not MCP) read of MAX(updated_at) across this
-// user+account's confirmed, non-superseded facts. Previously 300ms, sized only against this
-// query's own steady-state samples (~29-35ms in earlier testing) — but the category-lookup query
-// below is the same shape (direct SQL, small indexed table) and has been directly observed
-// exceeding its own 300ms budget in production. CockroachDB Basic scales to zero when idle
-// (confirmed separately, see challenges.md — intermittent multi-second latency was found to be
-// session-wide, affecting a connection's calls uniformly regardless of query complexity), so a
-// trivial query is not insulated from a cold-cluster event the way "cheap indexed aggregate"
-// sizing assumed. Raised to 1500ms — 5x the steady-state samples, meaningful (not complete)
-// protection against a moderate cold-cluster event, without this preliminary check itself
-// ballooning to multi-second cost on every request. A failure or timeout is still treated as
-// "unknown" (never blocks) — it just forces the slower cache-miss path below.
-const FACT_MARKER_TIMEOUT_MS = 1500
-
-// Two budgets, not one, because the two outcomes below have very different real cost:
-//   - Cache HIT (marker unchanged since last fetch): only the embedding call runs, no MCP at all.
-//     Was 1200ms. Directly falsified in production: a real cache-HIT request timed out at 1231ms,
-//     stuck entirely in embedding generation — confirming the embedding call alone, independent of
-//     MCP/CockroachDB entirely, can exceed 1200ms. Combined with an earlier direct measurement of a
-//     2423ms embedding call in this same investigation, raised to 2500ms — clears both the
-//     confirmed production failure and the worst directly-measured sample with real margin, not
-//     a marginal bump.
-//   - Cache MISS (first request for this user+account, or facts changed since): still needs the
-//     full embedding + MCP round trip. Measured MCP round trip alone at 718-6246ms in the
-//     connection-warming investigation. Not explicitly re-scoped by name, but raised here (3500 ->
-//     6500ms) for internal consistency: left at 3500ms, this budget would now be smaller than the
-//     hit-path embedding budget (2500ms) plus any nontrivial MCP time at all, which makes no sense
-//     given the miss path strictly does more work than the hit path. 6500ms covers embedding's
-//     worst case plus a substantial share of the documented MCP worst case, but does NOT reach
-//     full 2x margin over the combined worst case (~9000ms+) — that would mean a real user could
-//     wait 9+ seconds before a graceful degrade, which is judged an unacceptable UX tradeoff even
-//     under a "err toward reliability" instruction. Flagging this explicitly as a judgment call.
-// Voice is latency-sensitive (challenges.md); a miss taking multiple seconds is exactly why caching
-// this was worth doing — most turns should now land on the fast (2500ms) path, not the slow one.
-const FACT_HIT_TIMEOUT_MS = 2500
-const FACT_MISS_TIMEOUT_MS = 6500
+// Every call to getRelevantFactDescriptions now does a live embedding + MCP round trip — there is
+// no more cache-hit fast path (see getRelevantFactDescriptions's doc comment for why: the
+// candidate-fetch response-size fix below required dropping the cached-raw-embeddings design
+// entirely). So there's only one budget now, not a HIT/MISS pair. Value carried over from the old
+// MISS budget (3500 -> 6500ms), which was already sized for "full embedding + MCP round trip" —
+// exactly what every call does now. Evidence at the time: MCP round trip alone measured at
+// 718-6246ms in the connection-warming investigation, embedding calls up to 2423ms directly
+// measured, cache-HIT request observed timing out at 1231ms on embedding generation alone. 6500ms
+// covers embedding's worst case plus a substantial share of the documented MCP worst case, but does
+// NOT reach full 2x margin over the combined worst case (~9000ms+) — that would mean a real user
+// could wait 9+ seconds before a graceful degrade, judged an unacceptable UX tradeoff even under an
+// "err toward reliability" instruction. Flagging this explicitly as a judgment call, same as before.
+const FACT_QUERY_TIMEOUT_MS = 6500
 
 const BLOCKED_KEYWORDS = [
   "drop", "delete", "update", "insert", "truncate",
@@ -301,128 +277,49 @@ async function generateEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding
 }
 
-// The MCP select_query tool returns a VECTOR column as its pgvector text form ("[0.1,-0.2,...]"),
-// not a JSON array — parse defensively in case a future MCP server version returns it pre-parsed.
-function parseVectorColumn(raw: unknown): number[] {
-  if (Array.isArray(raw)) return raw.map(Number)
-  if (typeof raw === "string") {
-    return raw.replace(/^\[|\]$/g, "").split(",").map(Number)
-  }
-  throw new Error(`Unexpected embedding column format: ${typeof raw}`)
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  let dot = 0
-  let normA = 0
-  let normB = 0
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i]
-    normA += a[i] * a[i]
-    normB += b[i] * b[i]
-  }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
-}
-
-type FactCandidate = { description: string; embedding: number[] }
-type FactCacheEntry = { marker: string | null; candidates: FactCandidate[] }
-
-// Caches the candidate-fact fetch (not the final relevantFacts — those depend on each request's
-// own question embedding, which always changes) keyed by "userId:accountId". Module-scope, so it
-// survives only within one warm serverless instance's lifetime (Vercel/Lambda model) — reset on a
-// cold start, and not shared across concurrent instances. This is a fast-path optimization, not a
-// persistence layer: correctness never depends on an entry surviving, since a miss always falls
-// through to a real MCP fetch below.
-const factCandidatesCache = new Map<string, FactCacheEntry>()
-
-function factCacheKey(userId: string, accountId: string): string {
-  return `${userId}:${accountId}`
-}
-
-// The cheap freshness signal that drives cache invalidation: MAX(updated_at) across this
-// user+account's confirmed, non-superseded facts. Whenever distillation writes a new confirmed
-// fact (or promotes one from tentative), this value changes, which is exactly the "version" we
-// need — no separate marker table required. Superseded rows are excluded so an old row being
-// marked superseded_by doesn't matter once it's no longer a candidate anyway.
-//
-// Deliberately direct SQL (dbReadonly), not MCP — this is the one exception to "reads for this
-// feature go through MCP." The facts' actual content still only ever comes back via MCP below;
-// this marker never returns description/embedding data, only a timestamp.
-async function getFactsFreshnessMarker(userId: string, accountId: string): Promise<string | null> {
-  const result = (await dbReadonly.execute(sql.raw(`
-    SELECT MAX(updated_at) AS marker
-    FROM semantic_facts
-    WHERE user_id = '${userId}'
-      AND (account_id IS NULL OR account_id = '${accountId}')
-      AND confidence_status = 'confirmed'
-      AND superseded_by IS NULL
-  `))) as unknown as { rows: Record<string, unknown>[] }
-  const marker = result.rows[0]?.marker
-  return marker ? String(marker) : null
-}
-
-// Wraps the marker check in its own short timeout. A failure or timeout here is deliberately
-// collapsed to a single "unknown" outcome (not distinguished like the embedding/MCP path below) —
-// either way the only consequence is forcing the slower-but-always-correct cache-miss path, so
-// there's nothing further to act on by telling them apart.
-async function getFactsFreshnessMarkerOrUnknown(
-  userId: string,
-  accountId: string,
-): Promise<string | null | "unknown"> {
-  const work = getFactsFreshnessMarker(userId, accountId)
-  work.catch(() => {})
-
-  let timedOut = false
-  const timeout = new Promise<"timeout">((resolve) => {
-    setTimeout(() => {
-      timedOut = true
-      resolve("timeout")
-    }, FACT_MARKER_TIMEOUT_MS)
-  })
-
-  try {
-    const result = await Promise.race([work, timeout])
-    if (timedOut) {
-      logError({
-        context: "getFactsFreshnessMarkerOrUnknown",
-        error: new Error(`Marker check exceeded ${FACT_MARKER_TIMEOUT_MS}ms budget`),
-        userId,
-        accountId,
-        note: "treating as unknown — forces a fresh MCP fetch",
-      })
-      return "unknown"
-    }
-    return result as string | null
-  } catch (err) {
-    logError({
-      context: "getFactsFreshnessMarkerOrUnknown",
-      error: err,
-      userId,
-      accountId,
-      note: "treating as unknown — forces a fresh MCP fetch",
-    })
-    return "unknown"
-  }
-}
-
 // Confirmed semantic_facts whose embedding is similar to the question, for grounding the agent's
 // response — read-only (mcpSelectQuery only ever calls select_query), scoped to this user and
 // either user-level facts (account_id IS NULL) or facts for this specific account, so a fact from
 // a different account never leaks into this account's context.
 //
-// Similarity is computed in application code (cosineSimilarity), not in SQL via pgvector's <=>
-// operator — the MCP select_query tool caps query text at 16384 characters, and a 1536-dimension
-// embedding literal is ~29,000 characters on its own; inlining it into the query text (as an
-// earlier version of this function did, once in WHERE and once in ORDER BY — ~59,000 characters
-// total) failed on every single call with "query exceeds maximum length", not a timeout. The
-// candidate query carries no vector at all — only the filtered facts' `embedding` column comes
-// back as query *results*, which aren't subject to the same query-text cap. LIMIT 50 bounds the
-// candidate set at a level no real user's confirmed-fact count should approach.
+// Similarity is computed in SQL via pgvector's <=> operator, not in application code — this is a
+// deliberate reversal of an earlier version of this function, which fetched every confirmed fact's
+// raw `embedding` column via MCP (LIMIT 50) and scored candidates in JS. That design hit a
+// DIFFERENT MCP cap than the one below: "max result size exceeded" (a response *payload* size
+// limit) — confirmed empirically (temporary diagnostic script, same read-only approach as prior
+// investigations, deleted after use) by re-running the exact candidate query against the live MCP
+// connection with LIMIT 1, 2, 3, ... 50. LIMIT 1 succeeded (~19,269-char response — a single
+// 1536-float embedding column is already most of that). LIMIT 2 through 50 *all* failed with the
+// same error. There is no usable LIMIT above 1 for a query that returns a raw embedding column —
+// this isn't a "pick a smaller number" problem, the row shape itself has to change.
 //
-// The candidate fetch itself is cached (see factCandidatesCache) behind the freshness marker
-// above, so MCP is only actually hit on a genuine cache miss — expected to be roughly once per
-// distillation run per active user+account, not once per turn. This is why there are two timeout
-// budgets below rather than one: a hit only pays for the embedding call, a miss still pays for the
-// full embedding + MCP round trip.
+// The fix: never return a raw embedding over MCP at all. `1 - (embedding <=> '[...]'::vector) AS
+// similarity` computes the score inside CockroachDB, so the response only ever carries
+// description+similarity per row — empirically confirmed at ~1.7KB for this user's full confirmed-
+// fact set (10 rows) with this exact query shape, orders of magnitude under the cap. This also
+// solves the *other*, separately-diagnosed MCP limit (request query-TEXT capped at 16384
+// characters, see the git history for the investigation that found a full-precision 1536-dim
+// literal is ~29,000 characters on its own) — the query embedding is rounded to 4 decimal places
+// before being inlined (empirically measured at ~11,800 characters as a full query with that
+// rounding, ~28% margin below the 16384 cap; also confirmed live). Rounding only the *query's own*
+// embedding (never the stored ones) to 4 decimals introduces per-component error on the order of
+// 0.00005 — negligible next to the gap between "no match" (~0.20-0.25) and "match" (~0.46-0.52)
+// scores documented below; it does not shift which facts clear FACT_SIMILARITY_THRESHOLD.
+//
+// Trade-off, chosen deliberately over keeping the old cached-raw-embeddings design (see prior
+// git history): this function no longer caches anything across questions, since the embedding is
+// now baked into the query itself rather than fetched once and reused. Every call is a live MCP
+// round trip — there is no more cache-hit fast path. The page-load prefetch below still has real
+// value (it still warms the MCP connection ahead of the user's first real question, which
+// challenges.md's latency investigation identifies as the primary benefit), it just no longer also
+// pre-populates a reusable candidate cache, because there isn't one anymore. This was judged the
+// better trade against the alternative (fetching each confirmed fact's embedding via its own
+// single-row MCP call, in parallel, to stay under the per-response cap) — that alternative was
+// also tested live: it works, but 10 parallel single-row calls already took 6.7s wall-clock,
+// brushing against the very timeout budget below, and gets riskier (more concurrent connections,
+// no better real-world guarantee) as a user's confirmed-fact count grows. Computing the score in
+// SQL scales safely regardless of how many confirmed facts exist, since the response size no
+// longer depends on row count in any meaningful way.
 //
 // Takes both the isolated current-turn question and the contextual query text (see
 // buildContextualQueryText) — not a precomputed embedding, since the query_cache Tier-2 embedding
@@ -451,6 +348,42 @@ async function getFactsFreshnessMarkerOrUnknown(
 // the (latency-sensitive) voice advisor. Timeout and hard-error are logged distinctly (with
 // elapsed time, and — for a hard error — which of the two calls threw and the actual error) so a
 // stuck MCP connection doesn't read the same as an OpenAI auth failure.
+// Rounds an embedding to a fixed decimal precision and joins it into a pgvector literal body (no
+// surrounding brackets/cast) — shrinks a ~29,000-character full-precision literal to ~11,500
+// characters (empirically confirmed live), which is what keeps the query text under the MCP
+// select_query tool's 16384-character cap. See this function's doc comment above for the full
+// empirical basis (both this cap and the response-size cap that motivated computing similarity in
+// SQL at all).
+function embeddingLiteral(embedding: number[]): string {
+  return embedding.map((x) => x.toFixed(4)).join(",")
+}
+
+const CANDIDATE_FETCH_LIMIT = 20
+
+// One query per embedding — computes similarity in SQL (`1 - (embedding <=> ...)`), ordered by
+// that score, so the database itself does the relevance ranking (CockroachDB Tool #1, the Managed
+// MCP Server, stays the one interactive read path for facts' actual content — only the marker
+// check below is a direct-SQL exception). Returns id (for joining the two queries' results
+// together below) + description + similarity — never the raw embedding column.
+async function fetchScoredCandidates(
+  userId: string,
+  accountId: string,
+  embedding: number[],
+): Promise<{ id: string; description: string; similarity: number }[]> {
+  const vec = embeddingLiteral(embedding)
+  return mcpSelectQuery<{ id: string; description: string; similarity: number }>(`
+    SELECT id, description,
+      1 - (embedding <=> '[${vec}]'::vector) AS similarity
+    FROM semantic_facts
+    WHERE user_id = '${userId}'
+      AND (account_id IS NULL OR account_id = '${accountId}')
+      AND confidence_status = 'confirmed'
+      AND superseded_by IS NULL
+    ORDER BY similarity DESC
+    LIMIT ${CANDIDATE_FETCH_LIMIT}
+  `)
+}
+
 async function getRelevantFactDescriptions(
   userId: string,
   accountId: string,
@@ -458,20 +391,11 @@ async function getRelevantFactDescriptions(
   contextualQueryText: string,
 ): Promise<string[]> {
   const startedAt = Date.now()
-  const cacheKey = factCacheKey(userId, accountId)
-
-  const marker = await getFactsFreshnessMarkerOrUnknown(userId, accountId)
-  const markerMs = Date.now() - startedAt
-
-  const cached = factCandidatesCache.get(cacheKey)
-  const isHit = marker !== "unknown" && cached !== undefined && cached.marker === marker
-  const timeoutBudget = isHit ? FACT_HIT_TIMEOUT_MS : FACT_MISS_TIMEOUT_MS
 
   let step: "embedding" | "mcp_query" = "embedding"
   // Populated as each step finishes, so the split is known even if the *other* step is the one
   // that eventually times out or throws — e.g. a timeout stuck in "mcp_query" still reports how
-  // long the embedding call took before it got there. mcpMs stays null entirely on a cache hit,
-  // since that step is skipped, not merely fast.
+  // long the embedding call took before it got there.
   let embeddingMs: number | null = null
   let mcpMs: number | null = null
 
@@ -486,50 +410,35 @@ async function getRelevantFactDescriptions(
     ])
     embeddingMs = Date.now() - embeddingStartedAt
 
-    let candidates: FactCandidate[]
-    if (isHit && cached) {
-      candidates = cached.candidates
-    } else {
-      step = "mcp_query"
-      const mcpStartedAt = Date.now()
-      const rows = await mcpSelectQuery<{ description: string; embedding: unknown }>(`
-        SELECT description, embedding
-        FROM semantic_facts
-        WHERE user_id = '${userId}'
-          AND (account_id IS NULL OR account_id = '${accountId}')
-          AND confidence_status = 'confirmed'
-          AND superseded_by IS NULL
-        LIMIT 50
-      `)
-      mcpMs = Date.now() - mcpStartedAt
-      candidates = rows.map((row) => ({
-        description: row.description,
-        embedding: parseVectorColumn(row.embedding),
-      }))
-      // Only cache against a known marker — caching against "unknown" would let a later request
-      // treat an unverifiable version as if it were confirmed current.
-      if (marker !== "unknown") {
-        factCandidatesCache.set(cacheKey, { marker, candidates })
-      }
+    step = "mcp_query"
+    const mcpStartedAt = Date.now()
+    // Both queries run in parallel (independent reads) when there's history, so the added round
+    // trip costs wall-clock time roughly equal to one MCP call, not two sequential ones.
+    const [contextualRows, isolatedRows] = await Promise.all([
+      fetchScoredCandidates(userId, accountId, contextualEmbedding),
+      isolatedEmbedding ? fetchScoredCandidates(userId, accountId, isolatedEmbedding) : Promise.resolve(null),
+    ])
+    mcpMs = Date.now() - mcpStartedAt
+
+    // similarity is MIN(contextual, isolated) — see this function's doc comment for why. When
+    // there's no history, isolatedRows is null and contextualRows IS the isolated ranking
+    // (identical query text), so every candidate's score is already correct as-is.
+    if (isolatedRows === null) {
+      return contextualRows.map((r) => ({ description: r.description, similarity: r.similarity }))
     }
 
-    // Returns ALL scored candidates, unfiltered — filtering/sorting/slicing happens in the outer
-    // scope below, only once we know this result actually won the race against the timeout (see
-    // the bug this fixes, in logSimilarityOutcome's comment).
-    //
-    // similarity is MIN(contextual, isolated) — see this function's doc comment for why. When
-    // there's no history, isolatedEmbedding is null and contextualEmbedding IS the isolated
-    // embedding (identical text), so the two scores are the same value anyway.
-    return candidates.map((c) => {
-      const contextualSimilarity = cosineSimilarity(contextualEmbedding, c.embedding)
-      const isolatedSimilarity = isolatedEmbedding
-        ? cosineSimilarity(isolatedEmbedding, c.embedding)
-        : contextualSimilarity
-      return {
-        description: c.description,
-        similarity: Math.min(contextualSimilarity, isolatedSimilarity),
-      }
-    })
+    // Only facts that independently rank in *both* embeddings' top CANDIDATE_FETCH_LIMIT qualify
+    // for a MIN score — a fact absent from one side's top-K is itself informative (it doesn't
+    // genuinely share that embedding's topic), consistent with the original intent of requiring
+    // both signals to agree rather than blending them into one number.
+    const isolatedById = new Map(isolatedRows.map((r) => [r.id, r.similarity]))
+    const scored: { description: string; similarity: number }[] = []
+    for (const c of contextualRows) {
+      const isolatedSimilarity = isolatedById.get(c.id)
+      if (isolatedSimilarity === undefined) continue
+      scored.push({ description: c.description, similarity: Math.min(c.similarity, isolatedSimilarity) })
+    }
+    return scored
   })()
 
   // Logs whether a match cleared FACT_SIMILARITY_THRESHOLD, and its score — or that nothing did.
@@ -575,7 +484,7 @@ async function getRelevantFactDescriptions(
     setTimeout(() => {
       timedOut = true
       resolve("timeout")
-    }, timeoutBudget)
+    }, FACT_QUERY_TIMEOUT_MS)
   })
 
   // If the timeout branch wins the race below, `work` is still running — this still logs its
@@ -593,10 +502,9 @@ async function getRelevantFactDescriptions(
     if (timedOut) {
       console.error(
         `Semantic facts similarity search TIMED OUT after ${Date.now() - startedAt}ms `
-        + `(budget ${timeoutBudget}ms, ${isHit ? "cache hit" : "cache miss"} path) — `
-        + `still in "${step}" when the budget ran out. marker check: ${markerMs}ms, `
+        + `(budget ${FACT_QUERY_TIMEOUT_MS}ms) — still in "${step}" when the budget ran out. `
         + `embedding: ${embeddingMs ?? "did not finish"}ms, `
-        + `mcp_query: ${mcpMs ?? (isHit ? "skipped (cache hit)" : "did not finish")}ms `
+        + `mcp_query: ${mcpMs ?? "did not finish"}ms `
         + `— degrading to no memory context`,
       )
       return []
@@ -605,9 +513,7 @@ async function getRelevantFactDescriptions(
     logSimilarityOutcome(scoredAll, "used")
     console.log(
       `Semantic facts similarity search completed in ${Date.now() - startedAt}ms `
-      + `(${isHit ? "cache hit" : "cache miss"}; marker check: ${markerMs}ms, `
-      + `embedding: ${embeddingMs}ms, mcp_query: ${mcpMs ?? "skipped (cache hit)"}ms, `
-      + `budget ${timeoutBudget}ms)`,
+      + `(embedding: ${embeddingMs}ms, mcp_query: ${mcpMs}ms, budget ${FACT_QUERY_TIMEOUT_MS}ms)`,
     )
     return scoredAll
       .filter((c) => c.similarity > FACT_SIMILARITY_THRESHOLD)
@@ -622,9 +528,7 @@ async function getRelevantFactDescriptions(
       accountId,
       isolatedQuestionText,
       contextualQueryText,
-      isHit,
       elapsedMs: Date.now() - startedAt,
-      markerMs,
       embeddingMs,
       mcpMs,
       note: "degrading to no memory context",
@@ -1162,13 +1066,18 @@ export async function POST(request: Request) {
 
   const userId = session.user.id
 
-  // Fire-and-forget cache/cluster warm-up, triggered from the Macro page and Insights panel on
-  // mount — see their prefetch effects for the full rationale. Deliberately handled inside this
-  // same route (not a separate /api/insights/prefetch endpoint) so it shares this function's
-  // module-scope factCandidatesCache instance: a separate API route deploys as its own serverless
-  // function with its own memory, so warming a cache there would never be visible to a real
-  // question handled by this endpoint. Short-circuits before any of the heavier logic below
-  // (query_cache tiers, agent loop) — this only ever needs to run getRelevantFactDescriptions.
+  // Fire-and-forget MCP connection warm-up, triggered from the Macro page and Insights panel on
+  // mount — see their prefetch effects for the full rationale. Short-circuits before any of the
+  // heavier logic below (query_cache tiers, agent loop) — this only ever needs to run
+  // getRelevantFactDescriptions.
+  //
+  // getRelevantFactDescriptions no longer caches candidates across questions (see its doc comment
+  // — the response-size-cap fix that removed the raw-embedding fetch also removed what this
+  // prefetch used to warm). This call now only warms the MCP connection itself, which is still the
+  // documented primary benefit below, not a side effect of it — kept as a real API route (not a
+  // separate /api/insights/prefetch endpoint) mainly for consistency with how it was already wired
+  // in from the Macro/Insights mount effects, not because anything is shared across route instances
+  // anymore.
   //
   // Honest scope: a follow-up latency investigation found the multi-second spikes this warms
   // against are intermittent and connection-session-wide (~1 in 8 sessions in testing), not tied
