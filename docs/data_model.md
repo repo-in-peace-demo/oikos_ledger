@@ -2,12 +2,12 @@
 
 ## Status
 
-All 13 custom tables are implemented and verified. Defined in two places:
+All 15 custom tables are implemented and verified — the original 13 plus `episodic_events` and `semantic_facts`, added for the Oikos Recall agentic memory extension (see ADR 014). Defined in two places:
 
-- **Python** — `ingestion/models/` (SQLModel classes, authoritative for table creation)
+- **Python** — `ingestion/models/` (SQLModel classes, authoritative for table creation) — the memory tables specifically live in `ingestion/models/memory.py`
 - **TypeScript** — `app/lib/db/schema.ts` (Drizzle schema, mirrors Python for type-safe reads)
 
-> **Note on `spatial_ref_sys`:** PostGIS creates this system table. It appears in the Supabase/Aurora/CockroachDB Cloud table editor alongside the 13 custom tables but is not part of the Oikos Ledger schema.
+> **Note on `spatial_ref_sys`:** PostGIS creates this system table. It appears in the Supabase/Aurora/CockroachDB Cloud table editor alongside the 15 custom tables but is not part of the Oikos Ledger schema.
 
 ---
 
@@ -244,6 +244,65 @@ Caches NL→SQL query results. Two-tier lookup: exact SHA-256 hash first, then p
 | `created_at` | TIMESTAMPTZ | |
 
 `UNIQUE (user_id, account_id, query_hash)`
+
+---
+
+### `episodic_events`
+
+Immutable, append-only log of things that happened — a Macro/Compare page load, an account comparison, a per-category spend observation. This is the raw material the distillation Lambda scans to build `semantic_facts` below; nothing here is ever updated after insert.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `user_id` | UUID FK → `users.id` | |
+| `account_id` | UUID FK → `bank_accounts.id` | Nullable — NULL for events spanning multiple accounts (e.g. `comparison_run`, `macro_explanation`) |
+| `event_type` | TEXT | `macro_explanation` \| `insight_shown` \| `comparison_run` \| `category_spend_snapshot` \| ... |
+| `content` | TEXT | Human-readable description, embedded for similarity search |
+| `embedding` | VECTOR(1536) | pgvector |
+| `metadata` | JSONB | Nullable — event-specific structured data (see below) |
+| `created_at` | TIMESTAMPTZ | |
+
+**No `updated_at`** — same append-only convention as `transactions`.
+
+**`category_spend_snapshot`** (written by the Compare feature): one event per `(account_id, category)` per Compare click, `account_id` always populated (never NULL — this is account-level, unlike `comparison_run`). `metadata: { category: string, amount: number }` — `amount` is a rolling 30-day debit total for that category, not an all-time figure. This is the only event shape that gives the distillation job's generic trend/percentile pass something to group into `category_baseline` facts: it requires a real `account_id` plus a numeric `metadata.amount`/`metadata.category`, which no other event type provides.
+
+**`comparison_run`**: one event per Compare click, `account_id` NULL (spans the compared accounts). `metadata: { account_ids: string[], account_labels: Record<string, string> }` — `account_labels` is carried here because the distillation job (`oikos_recall_distill_rw`) has no grant on `bank_accounts` and can't look account names up itself when phrasing a `trend:comparison_snapshot` fact's description.
+
+**`macro_explanation`**: one event per Macro page load (throttled), `account_id` NULL. `metadata: { combined_balance: number, balance_state: string, reference_month: string, account_ids: string[] }` — `account_ids` (sorted) lets the distillation job detect when the *set* of accounts contributing to `combined_balance` changed between snapshots (e.g. a second account added), so it can reset the balance trend instead of narrating a structural change as a misleading balance jump (see `docs/challenges.md` #18).
+
+---
+
+### `semantic_facts`
+
+Distilled, decaying memory — the output of the distillation Lambda scanning `episodic_events`. Supersession, not overwrite: a materially-changed fact inserts a new row and points the old row's `superseded_by` at it, so history is preserved and only one row per key is ever "active" (`superseded_by IS NULL`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `user_id` | UUID FK → `users.id` | |
+| `account_id` | UUID FK → `bank_accounts.id` | Nullable — NULL for user-level facts (e.g. Macro's balance trend); non-NULL for account-specific facts (e.g. Compare's per-account category baselines) |
+| `compared_account_id` | UUID FK → `bank_accounts.id` | Nullable — the *other* account in the pair, populated only for `trend:comparison_snapshot` facts. NULL for every other `fact_type` |
+| `fact_type` | TEXT | `category_baseline` \| `trend:balance_snapshot` \| `trend:comparison_snapshot` \| ... |
+| `category` | TEXT | Nullable |
+| `description` | TEXT | Human-readable, embedded for similarity search |
+| `embedding` | VECTOR(1536) | pgvector |
+| `occurrence_count` | INTEGER | Default 0 — how many consecutive observations support this fact |
+| `opportunity_count` | INTEGER | Default 0 |
+| `running_mean` | NUMERIC | Nullable |
+| `confidence_status` | TEXT | `tentative` \| `confirmed` — confirmed once `occurrence_count` clears the distillation job's threshold |
+| `relevance_score` | NUMERIC | Default 1.0 — decays for facts not reinforced or accessed recently |
+| `last_accessed_at` | TIMESTAMPTZ | |
+| `superseded_by` | UUID FK → `semantic_facts.id` | Nullable — self-referential; NULL means this row is the currently active fact for its key |
+| `created_at` | TIMESTAMPTZ | |
+| `updated_at` | TIMESTAMPTZ | |
+
+**`category_baseline`**: per-account spending baseline for one category, built from that account's `category_spend_snapshot` episodic events. `account_id` populated, `compared_account_id` NULL.
+
+**`trend:comparison_snapshot`**: cross-account comparison — which of two accounts has run higher in a shared category across consecutive Compare checks. Both `account_id` and `compared_account_id` are populated (the pair being compared); only built once both accounts have a *confirmed* `category_baseline` for the same category.
+
+**`trend:balance_snapshot`**: user-level combined-balance trend across a user's accounts. `account_id` and `compared_account_id` both NULL.
+
+`UNIQUE (user_id, account_id, compared_account_id, fact_type, category) WHERE superseded_by IS NULL` — a partial index, not a plain unique constraint, so multiple superseded rows can share a key as long as only one is active. Extended to include `compared_account_id` when that column was added, so a `trend:comparison_snapshot` fact for account pair (A, B) doesn't collide with one for (A, C). Postgres/CockroachDB never treat two NULLs as equal for uniqueness purposes, so this index alone can't catch a duplicate user-level fact (`account_id IS NULL`) — the distillation job's `upsert_or_supersede_fact()` explicitly looks up the existing active row (matching NULL columns with `IS NULL`, not `=`) before deciding to insert, rather than relying on the index to reject a collision.
 
 ---
 

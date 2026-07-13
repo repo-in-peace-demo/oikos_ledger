@@ -234,7 +234,7 @@ Occasional multi-second latency spikes were observed against the CockroachDB Man
 
 Two mechanisms were proposed and tested directly: query-plan caching (cost paid once per distinct SQL shape) and connection-layer warm-up (cost paid once per connection, any shape). A controlled test — running a candidate-fact query, then a structurally different query against a different table, then repeating the original query, all on one persistent warm connection, across 8 fresh-connection trials — ruled out both in their clean form. The effect was session-wide and binary: either all three calls in a trial were slow (~2.9–3.2s) or all three were fast (~0.7–0.9s), never a "slow first call, fast afterward" pattern that would implicate query shape or one-time connection cost specifically. This points to intermittent, whole-session latency variance (shared infrastructure contention, routing, or something else not visible from outside the service) rather than either proposed mechanism — but this remains unconfirmed, not just unconfirmed-and-assumed.
 
-**Mitigation:** A background prefetch fires on page load (Macro page and Insights panel) that populates the fact-similarity cache and, as a side effect, exercises the MCP connection ahead of the user's first real question. This reduces the odds of a slow session landing on that first question by moving the cost earlier — it does not guarantee elimination, since a slow session could still occur later in the same session regardless of whether the prefetch already ran.
+**Mitigation:** A background prefetch fires on page load (Macro page and Insights panel) that exercises the MCP connection ahead of the user's first real question — originally this also warmed a reusable fact-similarity cache, but that cache was removed by the response-size-limit fix (see #17 below); the prefetch's remaining value is the connection warm-up itself. This reduces the odds of a slow session landing on that first question by moving the cost earlier — it does not guarantee elimination, since a slow session could still occur later in the same session regardless of whether the prefetch already ran.
 
 ---
 
@@ -243,3 +243,23 @@ Two mechanisms were proposed and tested directly: query-plan caching (cost paid 
 Bank statement exports may include transactions whose value date falls in a different month than the statement period they're delivered in. Observed case: an HDFC interest credit with a June value date posted into the July statement file.
 
 This is not currently handled — treated as a bank-specific export quirk rather than a pipeline bug, since the transaction is correctly parsed and recorded, just under the statement period it was actually delivered in rather than the period its value date implies.
+
+---
+
+## 17. CockroachDB Managed MCP Server — Response-Size Limit (separate from the request-size cap)
+
+Beyond the request query-text cap already noted in #15's investigation (the `select_query` tool caps query text at 16384 characters), the Managed MCP Server separately rejects *responses* above a certain payload size, failing with `MCP error: max result size exceeded`. This surfaced in the fact-similarity candidate-fetch query (`SELECT description, embedding FROM semantic_facts ...`), which returned every confirmed fact's raw 1536-dimension `embedding` column.
+
+Determined empirically, not assumed: a temporary diagnostic script re-ran the exact candidate query against the live MCP connection with `LIMIT 1, 2, 3, ... 50`. `LIMIT 1` succeeded (a single embedding-bearing row, ~19,269-character response). `LIMIT 2` through `LIMIT 50` all failed identically. There is no safe row count above 1 for a query that returns a raw embedding column — this ruled out simply picking a smaller limit; the row shape itself had to change.
+
+**Fix:** Cosine similarity is now computed inside CockroachDB via the `<=>` operator (`1 - (embedding <=> '[...]'::vector) AS similarity`), returning only `id`, `description`, and the computed `similarity` score — never the raw vector. Verified live at ~1.7KB for a full candidate set (10 rows), orders of magnitude under the cap. This also required rounding the query's own embedding to 4 decimal places before inlining it into the query text (~11,800 characters with that rounding vs. ~29,000 at full precision), to stay under the separate request-text cap.
+
+**Trade-off:** this removed a caching optimization. The candidate-fact fetch used to be cached (keyed by a distillation-freshness marker) and reused across a user's questions within a session, so most turns paid nothing beyond embedding generation. Since the query embedding is now baked into the query itself rather than fetched once and reused, every fact-similarity check does a live MCP round trip. Judged the better trade against the alternative (fetching each confirmed fact's embedding via its own single-row MCP call, run in parallel) — that alternative was also tested live and works, but already took 6.7s wall-clock for just 10 facts (close to the request timeout budget) and gets riskier, not safer, as a user's confirmed-fact count grows.
+
+---
+
+## 18. trend:balance_snapshot — Structural vs. Genuine Balance Changes
+
+A balance snapshot's percentage-change narration ("balance increased 12%...") is only meaningful when the same set of accounts contributed to the combined balance across consecutive snapshots. Adding or removing an account from the comparison changes the combined figure for a structural reason, not because spending or income changed — narrating that as a balance trend would be misleading (e.g. a second account added mid-session could read as "balance jumped 85%").
+
+**Fix:** Each `macro_explanation` episodic event now carries the sorted `account_ids` that contributed to that snapshot's `combined_balance`. The distillation job compares consecutive snapshots' account-id sets before computing a percentage change: if the set differs, the trend resets with a distinct description ("Started tracking a new account — balance trend will resume from here...") and `occurrence_count=1`, instead of computing a misleading jump. A snapshot with an unknown account-id set (recorded before this field existed) is treated as unchanged — the same conservative default the code had before this field existed — rather than risk masking a genuine trend off incomplete historical data.

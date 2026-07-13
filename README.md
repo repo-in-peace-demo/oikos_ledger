@@ -99,6 +99,8 @@ If you want to start fresh as a guest:
 | CockroachDB tool #2 | Distributed Vector Indexing (semantic recall over past insights) |
 | AWS service | Lambda, Python 3.12 (scheduled batch distillation job) |
 
+**Note on vector similarity:** The fact-similarity check that grounds the agent's responses (Insights, Macro, Compare) computes cosine similarity server-side inside CockroachDB via the `<=>` operator (`1 - (embedding <=> ...)`), with the database doing the relevance ranking natively — not in application code. This wasn't the original design: an earlier version fetched every confirmed fact's raw embedding vector via MCP and computed similarity in JavaScript, which turned out to hit the Managed MCP Server's response-size cap once a user had more than one confirmed fact (see `docs/challenges.md` #17). Moving the computation into CockroachDB fixed that and is a more direct exercise of Distributed Vector Indexing than the original approach was.
+
 **Note on MCP Server access control:** CockroachDB's Managed MCP Server scopes access at the whole-cluster Cloud RBAC level (the Cluster Operator role, in this project's case) for autonomous API-key connections — there is no platform-level mechanism to restrict a given connection to read-only, or to specific tables or operations. The read/write separation between this project's interactive path (read-only in practice) and its distillation path (read/write) is enforced in application code, not by the platform: the interactive path simply never issues write-shaped MCP tool calls (`insert_rows`, `create_table`, `create_database`). This is a deliberate, understood design choice given what the platform actually offers today, not an oversight.
 
 ---

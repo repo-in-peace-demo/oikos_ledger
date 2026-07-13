@@ -1,10 +1,12 @@
 // Compares distilled memory (episodic_events + semantic_facts) across two or more of the user's accounts
 import { and, eq, gte, sql } from "drizzle-orm"
+import { after } from "next/server"
 import { auth } from "@/auth"
-import { db } from "@/lib/db/client"
+import { db, dbReadonly } from "@/lib/db/client"
 import { episodic_events, transactions } from "@/lib/db/schema"
 import { getBankAccountsByUserId } from "@/lib/db/queries/bank_accounts"
 import { generateEmbedding } from "@/lib/embeddings"
+import { logError } from "@/lib/logger"
 import { mcpSelectQuery } from "@/lib/mcp/client"
 
 export const dynamic = "force-dynamic"
@@ -72,7 +74,63 @@ type AccountMemory = {
   semantic_facts: SemanticFactRow[]
 }
 
+// Both reads below (loadAccountMemory, loadComparisonSnapshots) only change when distillation
+// writes/supersedes a semantic_facts row — never per-request — the same situation the Insights
+// fact-similarity cache was built for (see app/app/api/insights/query/route.ts's now-removed
+// factCandidatesCache/getFactsFreshnessMarker). That cache was later removed for an unrelated
+// reason: it fetched raw embedding vectors in bulk, which hit the MCP select_query tool's
+// response-size cap ("max result size exceeded", confirmed empirically to fail above 1 row when a
+// query returns a 1536-float embedding column). These two queries never select `embedding` at
+// all — empirically confirmed live at 0.6-4.2KB per call for this account's real data (20 events +
+// several category_baseline facts), orders of magnitude under that cap — so the same caching
+// pattern is safe to bring back here without re-hitting that limit.
+//
+// Marker checks are direct SQL (dbReadonly), not MCP — same one exception to "reads for this
+// feature go through MCP" the Insights fix used: the marker never returns fact content, only a
+// timestamp, so there's nothing here that needs the Managed MCP Server's involvement.
+type AccountMemoryCacheEntry = { marker: string | null; data: Omit<AccountMemory, "label"> }
+const accountMemoryCache = new Map<string, AccountMemoryCacheEntry>()
+
+type ComparisonSnapshotCacheEntry = { marker: string | null; data: ComparisonSnapshotRow[] }
+const comparisonSnapshotCache = new Map<string, ComparisonSnapshotCacheEntry>()
+
+// MAX(updated_at) across this account's active category_baseline facts — the onupdate trigger on
+// semantic_facts.updated_at (see ingestion/models/memory.py) fires on every bump-in-place or
+// supersession, so this changes exactly when loadAccountMemory's semantic_facts result would.
+// Deliberately doesn't cover episodic_events (recent_events) — those change on every Compare click
+// via this account's own category_spend_snapshot writes, far more often than distillation runs,
+// but recent_events isn't actually rendered anywhere in ComparePanel.tsx today, so a cache hit
+// occasionally serving one cycle's worth of stale recent_events is unobservable, not a real bug.
+async function getAccountMemoryMarker(userId: string, accountId: string): Promise<string | null> {
+  const result = (await dbReadonly.execute(sql.raw(`
+    SELECT MAX(updated_at) AS marker
+    FROM semantic_facts
+    WHERE user_id = '${userId}'
+      AND account_id = '${accountId}'
+      AND fact_type = '${ACCOUNT_CATEGORY_BASELINE_FACT_TYPE}'
+      AND superseded_by IS NULL
+  `))) as unknown as { rows: Record<string, unknown>[] }
+  const marker = result.rows[0]?.marker
+  return marker ? String(marker) : null
+}
+
 async function loadAccountMemory(userId: string, accountId: string): Promise<Omit<AccountMemory, "label">> {
+  const cacheKey = `${userId}:${accountId}`
+
+  let marker: string | null = null
+  try {
+    marker = await getAccountMemoryMarker(userId, accountId)
+  } catch (err) {
+    // Marker check failing just means "can't verify freshness" — fall through to a real fetch
+    // below rather than risk serving a stale (or wrong) cached entry.
+    logError({ context: "loadAccountMemory.marker", error: err, userId, accountId })
+  }
+
+  const cached = accountMemoryCache.get(cacheKey)
+  if (cached && cached.marker === marker) {
+    return cached.data
+  }
+
   const [events, facts] = await Promise.all([
     mcpSelectQuery<EpisodicEventRow>(`
       SELECT id, event_type, content, created_at
@@ -91,7 +149,31 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
       ORDER BY relevance_score DESC
     `),
   ])
-  return { account_id: accountId, episodic_events: events, semantic_facts: facts }
+  const data = { account_id: accountId, episodic_events: events, semantic_facts: facts }
+  accountMemoryCache.set(cacheKey, { marker, data })
+  return data
+}
+
+// Canonical, order-independent key for an account pair — the same two accounts can arrive here in
+// either order depending on which the user happened to click first, and should hit the same cache
+// entry either way.
+function pairCacheKey(userId: string, accountIds: string[]): string {
+  return `${userId}:${[...accountIds].sort().join(",")}`
+}
+
+async function getComparisonSnapshotMarker(userId: string, accountIds: string[]): Promise<string | null> {
+  const idList = accountIds.map((id) => `'${id}'`).join(",")
+  const result = (await dbReadonly.execute(sql.raw(`
+    SELECT MAX(updated_at) AS marker
+    FROM semantic_facts
+    WHERE user_id = '${userId}'
+      AND fact_type = '${COMPARISON_SNAPSHOT_FACT_TYPE}'
+      AND superseded_by IS NULL
+      AND account_id IN (${idList})
+      AND compared_account_id IN (${idList})
+  `))) as unknown as { rows: Record<string, unknown>[] }
+  const marker = result.rows[0]?.marker
+  return marker ? String(marker) : null
 }
 
 // Fetches trend:comparison_snapshot facts for any pair within the selected account set —
@@ -102,8 +184,22 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
 // column. The description text already names both accounts by label, so no separate label
 // resolution is needed here the way category_deltas/unique_categories need per-account values.
 async function loadComparisonSnapshots(userId: string, accountIds: string[]): Promise<ComparisonSnapshotRow[]> {
+  const cacheKey = pairCacheKey(userId, accountIds)
+
+  let marker: string | null = null
+  try {
+    marker = await getComparisonSnapshotMarker(userId, accountIds)
+  } catch (err) {
+    logError({ context: "loadComparisonSnapshots.marker", error: err, userId, accountIds })
+  }
+
+  const cached = comparisonSnapshotCache.get(cacheKey)
+  if (cached && cached.marker === marker) {
+    return cached.data
+  }
+
   const idList = accountIds.map((id) => `'${id}'`).join(",")
-  return mcpSelectQuery<ComparisonSnapshotRow>(`
+  const data = await mcpSelectQuery<ComparisonSnapshotRow>(`
     SELECT id, category, description, occurrence_count, confidence_status, updated_at
     FROM semantic_facts
     WHERE user_id = '${userId}'
@@ -113,6 +209,8 @@ async function loadComparisonSnapshots(userId: string, accountIds: string[]): Pr
       AND compared_account_id IN (${idList})
     ORDER BY updated_at DESC
   `)
+  comparisonSnapshotCache.set(cacheKey, { marker, data })
+  return data
 }
 
 // Per-category debit totals for one account over the trailing CATEGORY_SNAPSHOT_LOOKBACK_DAYS —
@@ -214,6 +312,36 @@ function buildCategoryDeltas(accounts: AccountMemory[]) {
   })
 }
 
+// Records the comparison_run summary event that distillation's _extract_comparison_pairs reads
+// back to know which account pairs have actually been compared. Not on the response's critical
+// path (see the POST handler's after() call below) — this only feeds future distillation runs,
+// nothing the user waits on right now.
+async function recordComparisonRunEvent(
+  userId: string,
+  accountMemories: AccountMemory[],
+  categoryDeltaCount: number,
+  validIds: string[],
+): Promise<void> {
+  const summary = `Compared ${accountMemories.length} accounts (${accountMemories.map((a) => a.label).join(", ")}) `
+    + `across ${categoryDeltaCount} categories with distilled baselines.`
+  const embedding = await generateEmbedding(summary)
+  // account_labels alongside account_ids — the distillation job (oikos_recall_distill_rw) has
+  // no grant on bank_accounts, same constraint as trend:balance_snapshot's combined_balance
+  // (see distillation/pipeline/distiller.py), so it can't look account names up itself when
+  // writing a trend:comparison_snapshot fact's description ("HDFC has run higher than Axis...").
+  // Carrying the labels here, computed once at request time where bank_accounts is already
+  // available, is the same workaround pattern already established for that fact type.
+  const account_labels = Object.fromEntries(accountMemories.map((a) => [a.account_id, a.label]))
+  await db.insert(episodic_events).values({
+    user_id: userId,
+    account_id: null, // spans multiple accounts — see metadata.account_ids
+    event_type: "comparison_run",
+    content: summary,
+    embedding,
+    metadata: { account_ids: validIds, account_labels },
+  })
+}
+
 function buildFactOverlap(accounts: AccountMemory[]) {
   const categoriesByAccount = accounts.map(
     (acc) => new Set(acc.semantic_facts.map((f) => f.category).filter(Boolean) as string[]),
@@ -284,35 +412,23 @@ export async function POST(request: Request) {
     console.error("Failed to load comparison_snapshot facts:", err)
   }
 
-  const summary = `Compared ${accountMemories.length} accounts (${accountMemories.map((a) => a.label).join(", ")}) `
-    + `across ${category_deltas.length} categories with distilled baselines.`
-
-  try {
-    const embedding = await generateEmbedding(summary)
-    // account_labels alongside account_ids — the distillation job (oikos_recall_distill_rw) has
-    // no grant on bank_accounts, same constraint as trend:balance_snapshot's combined_balance
-    // (see distillation/pipeline/distiller.py), so it can't look account names up itself when
-    // writing a trend:comparison_snapshot fact's description ("HDFC has run higher than Axis...").
-    // Carrying the labels here, computed once at request time where bank_accounts is already
-    // available, is the same workaround pattern already established for that fact type.
-    const account_labels = Object.fromEntries(accountMemories.map((a) => [a.account_id, a.label]))
-    await db.insert(episodic_events).values({
-      user_id: userId,
-      account_id: null, // spans multiple accounts — see metadata.account_ids
-      event_type: "comparison_run",
-      content: summary,
-      embedding,
-      metadata: { account_ids: validIds, account_labels },
+  // Both writes below only feed future distillation runs — nothing in this response depends on
+  // them, so they run after the response is sent (Next.js's after()) instead of blocking it.
+  // Promise.allSettled (not Promise.all) so one write's failure doesn't stop the other from
+  // completing, and both failures get logged rather than swallowed just because they're no longer
+  // on the request's critical path.
+  after(async () => {
+    const results = await Promise.allSettled([
+      recordComparisonRunEvent(userId, accountMemories, category_deltas.length, validIds),
+      recordCategorySpendSnapshots(userId, accountMemories),
+    ])
+    const contexts = ["compare.recordComparisonRunEvent", "compare.recordCategorySpendSnapshots"]
+    results.forEach((result, i) => {
+      if (result.status === "rejected") {
+        logError({ context: contexts[i], error: result.reason, userId, accountIds: validIds })
+      }
     })
-  } catch (err) {
-    console.error("Failed to record comparison_run episodic event:", err)
-  }
-
-  try {
-    await recordCategorySpendSnapshots(userId, accountMemories)
-  } catch (err) {
-    console.error("Failed to record category_spend_snapshot episodic events:", err)
-  }
+  })
 
   return Response.json({
     accounts: accountMemories.map((a) => ({
