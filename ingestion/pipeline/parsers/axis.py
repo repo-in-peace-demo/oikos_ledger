@@ -34,23 +34,42 @@ class AxisParser(BaseCSVParser):
     }
 
     # Prefixes whose category is a guess, not a certainty, unlike ATM-CASH-AXIS (always an ATM
-    # withdrawal) or INB (always a transfer) — the merchant behind a card swipe could be a
-    # grocer, a pharmacy, a clothing store, anything. normalize_narration below routes these
-    # through the same deterministic keyword scorer + subcategory detection HDFC's parser uses
+    # withdrawal) or UPI/P2A (explicitly person-to-person by construction — see SLASH_PATTERNS
+    # below). INB used to be treated as certain-Transfer too, on the theory that "internet
+    # banking" describes a payment *method*, not a category — but real statement evidence
+    # (INB/916677275/SWIGGY(RAZORPAY)/, appearing three separate times) shows INB routes plenty
+    # of genuine merchant payments, exactly the same blind spot POS/PUR had before this fix. The
+    # merchant behind an INB/POS/PUR/ECOM PUR/UPI-P2M transaction could be a grocer, a pharmacy, a
+    # streaming service, anything. normalize_narration below routes these through the same
+    # deterministic keyword scorer + subcategory detection HDFC's parser uses
     # (categorize_transaction/detect_subcategory) instead of trusting SLASH_PATTERNS' category
-    # outright, and only falls back to it if that lookup genuinely finds nothing.
-    CATEGORY_UNCERTAIN_PREFIXES = frozenset({"POS", "PUR"})
+    # outright, and only falls back to it if that lookup genuinely finds nothing (e.g. INB
+    # narrations that are genuinely gateway-only with no real merchant name, like a bare
+    # "INB/.../PAYU.IN/").
+    CATEGORY_UNCERTAIN_PREFIXES = frozenset({"POS", "PUR", "ECOM PUR", "INB", "UPI/P2M"})
 
     # Slash-pattern narrations — extracted deterministically
     # Format: {PREFIX}/{SEGMENT1}/{MERCHANT_OR_INFO}/...
     # merchant_segment_index: position of merchant in slash parts (-1 = last non-empty)
     # category here is a default — for CATEGORY_UNCERTAIN_PREFIXES it's only used as a fallback,
     # not returned outright; see normalize_narration.
+    #
+    # UPI/P2A vs UPI/P2M: Axis's own narration explicitly encodes which of the two this is — P2A
+    # (person-to-account) names appear as personal names ("Mr Darshan Sharad Mah", "Indal
+    # Chaupal"), never a merchant, so this is treated as certain Transfer, the same confidence
+    # level as ATM-CASH-AXIS — no categorizer involved. P2M (person-to-merchant) names a real
+    # merchant ("MAHARASHTRA PROVISION", "IRCTC UTS"), so it's in CATEGORY_UNCERTAIN_PREFIXES
+    # above, same treatment as POS/PUR. ECOM PUR (e.g. "ECOM PUR/Youtube/122002/160722/18:48") is
+    # a distinct prefix from plain PUR, not a variant of it — "ECOM PUR/...".startswith("PUR/") is
+    # False, so without its own entry these fall through both matching steps entirely, unmatched.
     SLASH_PATTERNS: dict[str, tuple[str, str, int]] = {
         "ATM-CASH-AXIS": ("ATM", "ATM Withdrawal", -1),
         "INB": ("NEFT", "Transfer", 2),
         "POS": ("POS", "Shopping", 1),
         "PUR": ("POS", "Shopping", 1),
+        "ECOM PUR": ("POS", "Shopping", 1),
+        "UPI/P2A": ("UPI", "Transfer", 3),
+        "UPI/P2M": ("UPI", "Transfer", 3),
     }
 
     @property
@@ -110,7 +129,7 @@ class AxisParser(BaseCSVParser):
         """Handle Axis Bank narration patterns.
 
         Priority:
-        1. Slash patterns (ATM-CASH-AXIS/, INB/, POS/, PUR/)
+        1. Slash patterns (ATM-CASH-AXIS/, INB/, POS/, PUR/, ECOM PUR/, UPI/P2A/, UPI/P2M/)
         2. Axis narration codes (CWDR, CLG, SETU, etc.)
         """
         upper = narration.upper().strip()
@@ -136,7 +155,9 @@ class AxisParser(BaseCSVParser):
                     )
 
                 if prefix not in self.CATEGORY_UNCERTAIN_PREFIXES:
-                    # ATM-CASH-AXIS, INB — the category really is certain from the prefix alone.
+                    # ATM-CASH-AXIS, UPI/P2A — the category really is certain from the prefix
+                    # alone (a cash withdrawal, or a narration Axis itself has already tagged as
+                    # person-to-person).
                     return NarrationResult(
                         merchant=merchant,
                         payment_method=payment_method,
@@ -145,10 +166,11 @@ class AxisParser(BaseCSVParser):
                         needs_llm=False,
                     )
 
-                # POS/PUR — a card swipe's category depends entirely on which merchant is behind
-                # it, so the prefix's own default is a fallback, not a first guess. Run the same
-                # deterministic keyword scorer + subcategory detection HDFC's parser relies on
-                # (both pure functions — no registry/DB/LLM access from here, this stays sync).
+                # POS/PUR/ECOM PUR/INB/UPI-P2M — the category depends entirely on which merchant
+                # is behind the transaction, so the prefix's own default is a fallback, not a
+                # first guess. Run the same deterministic keyword scorer + subcategory detection
+                # HDFC's parser relies on (both pure functions — no registry/DB/LLM access from
+                # here, this stays sync).
                 scored_category = categorize_transaction(narration, merchant, payment_method)
                 subcategory, subcategory_override = detect_subcategory(merchant, narration)
                 genuine_category = subcategory_override or (
