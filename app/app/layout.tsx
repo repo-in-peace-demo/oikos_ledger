@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Oikos Ledger",
+  title: "Oikos Recall",
   description: "Personal finance intelligence",
   icons: {
     icon: '/fallback-bank-icon.svg',

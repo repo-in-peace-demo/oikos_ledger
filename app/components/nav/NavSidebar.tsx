@@ -60,54 +60,65 @@ export function NavSidebar({ user, signOutAction }: Props) {
 
   return (
     <aside className="flex w-14 shrink-0 flex-col border-r bg-card overflow-visible">
-      {/* Logo */}
+      {/* Logo — also doubles as a sign-out button, taking the user back to the login page */}
       <div className="flex h-14 items-center justify-center border-b shrink-0">
-        <svg
-          width="28"
-          height="28"
-          viewBox="0 0 28 28"
-          fill="none"
-          xmlns="http://www.w3.org/2000/svg"
-          aria-label="Oikos Ledger"
-        >
-          {/* Roof */}
-          <path
-            d="M4 13L14 4L24 13"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-          {/* House walls */}
-          <path
-            d="M6 12V23H22V12"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-          {/* Ledger line — horizontal balance line through middle of house */}
-          <line
-            x1="9"
-            y1="17"
-            x2="19"
-            y2="17"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-          />
-          {/* Second ledger line — suggests double-entry bookkeeping */}
-          <line
-            x1="9"
-            y1="20"
-            x2="16"
-            y2="20"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            opacity="0.5"
-          />
-        </svg>
+        <form action={signOutAction}>
+          <button
+            type="submit"
+            title="Sign out"
+            aria-label="Sign out"
+            className="flex items-center justify-center rounded-md p-1
+              text-foreground hover:bg-accent hover:text-accent-foreground
+              transition-colors duration-150"
+          >
+            <svg
+              width="28"
+              height="28"
+              viewBox="0 0 28 28"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              aria-label="Oikos Recall"
+            >
+              {/* Roof */}
+              <path
+                d="M4 13L14 4L24 13"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              {/* House walls */}
+              <path
+                d="M6 12V23H22V12"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              {/* Ledger line — horizontal balance line through middle of house */}
+              <line
+                x1="9"
+                y1="17"
+                x2="19"
+                y2="17"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+              {/* Second ledger line — suggests double-entry bookkeeping */}
+              <line
+                x1="9"
+                y1="20"
+                x2="16"
+                y2="20"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                opacity="0.5"
+              />
+            </svg>
+          </button>
+        </form>
       </div>
 
       {/* Nav items */}
