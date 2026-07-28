@@ -1,0 +1,2 @@
+# Run script to allow the rolling averages and Memory panel catch up to this now-correct data over a few real snapshots
+aws lambda invoke --function-name oikos-recall-distillation --profile oikos-recall --region ap-south-1 /tmp/out.json
