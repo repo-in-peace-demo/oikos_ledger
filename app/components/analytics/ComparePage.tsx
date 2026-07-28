@@ -3,7 +3,11 @@
 import { useAccounts } from "@/components/accounts/AccountsContext"
 import { ComparePanel } from "./ComparePanel"
 
-export function ComparePage() {
+interface Props {
+  firstName?: string
+}
+
+export function ComparePage({ firstName }: Props) {
   const { accounts } = useAccounts()
 
   return (
@@ -15,7 +19,7 @@ export function ComparePage() {
         </p>
       </div>
       <div className="flex-1 overflow-y-auto p-6">
-        <ComparePanel accounts={accounts} />
+        <ComparePanel accounts={accounts} firstName={firstName} />
       </div>
     </div>
   )
