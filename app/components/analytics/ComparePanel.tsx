@@ -2,6 +2,7 @@
 
 import { useState } from "react"
 import type { BankAccount } from "@/types"
+import { CompareVoiceButton } from "./CompareVoiceButton"
 
 interface CategoryDelta {
   category: string
@@ -24,7 +25,7 @@ interface ComparisonSnapshot {
   updated_at: string
 }
 
-interface CompareResponse {
+export interface CompareResponse {
   accounts: AccountResult[]
   category_deltas: CategoryDelta[]
   category_baseline_window_days: number
@@ -43,6 +44,7 @@ function formatDate(iso: string): string {
 
 interface ComparePanelProps {
   accounts: BankAccount[]
+  firstName?: string
 }
 
 function accountLabel(a: BankAccount): string {
@@ -80,7 +82,7 @@ function higherAccountId(row: CategoryDelta): string | null {
   return best?.accountId ?? null
 }
 
-export function ComparePanel({ accounts }: ComparePanelProps) {
+export function ComparePanel({ accounts, firstName }: ComparePanelProps) {
   const [selectedIds, setSelectedIds] = useState<string[]>(
     accounts.slice(0, MAX_COMPARE_ACCOUNTS).map((a) => a.id),
   )
@@ -184,6 +186,8 @@ export function ComparePanel({ accounts }: ComparePanelProps) {
 
       {data && (
         <>
+          <CompareVoiceButton compareData={data} firstName={firstName} />
+
           <div className="rounded-xl border bg-card p-5 space-y-3">
             <div>
               <p className="text-sm font-semibold text-slate-700">Category spend deltas</p>
