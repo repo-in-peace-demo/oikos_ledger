@@ -5,6 +5,10 @@ import { auth } from "@/auth"
 import { db, dbReadonly } from "@/lib/db/client"
 import { episodic_events, transactions } from "@/lib/db/schema"
 import { getBankAccountsByUserId } from "@/lib/db/queries/bank_accounts"
+import {
+  type ComparisonSnapshotRow,
+  loadComparisonSnapshots,
+} from "@/lib/compare/comparisonSnapshots"
 import { generateEmbedding } from "@/lib/embeddings"
 import { logError } from "@/lib/logger"
 import { mcpSelectQuery } from "@/lib/mcp/client"
@@ -43,20 +47,6 @@ type EpisodicEventRow = {
 // fact_type. Part C's distillation job writes facts under this same fact_type constant.
 const ACCOUNT_CATEGORY_BASELINE_FACT_TYPE = "category_baseline"
 
-// account_id/compared_account_id are both real columns (see ingestion/models/memory.py) — the
-// distillation job writes facts under this same fact_type constant once both accounts have a
-// confirmed category_baseline for the same category.
-const COMPARISON_SNAPSHOT_FACT_TYPE = "trend:comparison_snapshot"
-
-type ComparisonSnapshotRow = {
-  id: string
-  category: string
-  description: string
-  occurrence_count: number
-  confidence_status: string
-  updated_at: string
-}
-
 type SemanticFactRow = {
   id: string
   category: string | null
@@ -90,9 +80,6 @@ type AccountMemory = {
 // timestamp, so there's nothing here that needs the Managed MCP Server's involvement.
 type AccountMemoryCacheEntry = { marker: string | null; data: Omit<AccountMemory, "label"> }
 const accountMemoryCache = new Map<string, AccountMemoryCacheEntry>()
-
-type ComparisonSnapshotCacheEntry = { marker: string | null; data: ComparisonSnapshotRow[] }
-const comparisonSnapshotCache = new Map<string, ComparisonSnapshotCacheEntry>()
 
 // MAX(updated_at) across this account's active category_baseline facts — the onupdate trigger on
 // semantic_facts.updated_at (see ingestion/models/memory.py) fires on every bump-in-place or
@@ -151,65 +138,6 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
   ])
   const data = { account_id: accountId, episodic_events: events, semantic_facts: facts }
   accountMemoryCache.set(cacheKey, { marker, data })
-  return data
-}
-
-// Canonical, order-independent key for an account pair — the same two accounts can arrive here in
-// either order depending on which the user happened to click first, and should hit the same cache
-// entry either way.
-function pairCacheKey(userId: string, accountIds: string[]): string {
-  return `${userId}:${[...accountIds].sort().join(",")}`
-}
-
-async function getComparisonSnapshotMarker(userId: string, accountIds: string[]): Promise<string | null> {
-  const idList = accountIds.map((id) => `'${id}'`).join(",")
-  const result = (await dbReadonly.execute(sql.raw(`
-    SELECT MAX(updated_at) AS marker
-    FROM semantic_facts
-    WHERE user_id = '${userId}'
-      AND fact_type = '${COMPARISON_SNAPSHOT_FACT_TYPE}'
-      AND superseded_by IS NULL
-      AND account_id IN (${idList})
-      AND compared_account_id IN (${idList})
-  `))) as unknown as { rows: Record<string, unknown>[] }
-  const marker = result.rows[0]?.marker
-  return marker ? String(marker) : null
-}
-
-// Fetches trend:comparison_snapshot facts for any pair within the selected account set —
-// account_id/compared_account_id are a canonical sorted pair internally (see
-// _extract_comparison_pairs in distillation/pipeline/distiller.py), but that ordering is an
-// implementation detail; matching both columns against the same IN-list surfaces a fact
-// regardless of which of the two selected IDs the distillation job happened to store as which
-// column. The description text already names both accounts by label, so no separate label
-// resolution is needed here the way category_deltas/unique_categories need per-account values.
-async function loadComparisonSnapshots(userId: string, accountIds: string[]): Promise<ComparisonSnapshotRow[]> {
-  const cacheKey = pairCacheKey(userId, accountIds)
-
-  let marker: string | null = null
-  try {
-    marker = await getComparisonSnapshotMarker(userId, accountIds)
-  } catch (err) {
-    logError({ context: "loadComparisonSnapshots.marker", error: err, userId, accountIds })
-  }
-
-  const cached = comparisonSnapshotCache.get(cacheKey)
-  if (cached && cached.marker === marker) {
-    return cached.data
-  }
-
-  const idList = accountIds.map((id) => `'${id}'`).join(",")
-  const data = await mcpSelectQuery<ComparisonSnapshotRow>(`
-    SELECT id, category, description, occurrence_count, confidence_status, updated_at
-    FROM semantic_facts
-    WHERE user_id = '${userId}'
-      AND fact_type = '${COMPARISON_SNAPSHOT_FACT_TYPE}'
-      AND superseded_by IS NULL
-      AND account_id IN (${idList})
-      AND compared_account_id IN (${idList})
-    ORDER BY updated_at DESC
-  `)
-  comparisonSnapshotCache.set(cacheKey, { marker, data })
   return data
 }
 

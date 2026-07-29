@@ -23,7 +23,7 @@ import type { CompareResponse } from "./ComparePanel"
 const VOICE_ENABLED = process.env.NEXT_PUBLIC_VOICE_ENABLED === "true"
 const NEAR_BOTTOM_THRESHOLD_PX = 48
 
-type Turn = { role: "user" | "assistant"; content: string }
+type Turn = { id: string; role: "user" | "assistant"; content: string }
 
 interface Props {
   compareData: CompareResponse | null
@@ -45,6 +45,9 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
   const isResponseInProgress = useRef(false)
   const processedCallIds = useRef<Set<string>>(new Set())
   const lastTranscriptRef = useRef<string>("")
+  // The user-turn placeholder created at speech_started, filled in once transcription completes —
+  // see the fix note on addTurn/speech_started below.
+  const pendingUserTurnId = useRef<string | null>(null)
   const currentAssistantItemId = useRef<string | null>(null)
   const mutedItemId = useRef<string | null>(null)
   const audioSamplesPlayed = useRef<number>(0)
@@ -78,8 +81,17 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
   }, [turns])
 
-  function addTurn(turn: Turn) {
-    setTurns((prev) => [...prev, turn])
+  // Ordering key is assigned here, at insertion time — for the user role this is called from
+  // speech_started (see below), before transcription or any response exists, so no assistant
+  // reply (however fast) can ever be inserted ahead of the question that prompted it.
+  function addTurn(turn: Omit<Turn, "id">): string {
+    const id = crypto.randomUUID()
+    setTurns((prev) => [...prev, { ...turn, id }])
+    return id
+  }
+
+  function updateTurn(id: string, updates: Partial<Omit<Turn, "id">>) {
+    setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)))
   }
 
   function stopMicCapture() {
@@ -303,6 +315,16 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
         // Barge-in — same pattern as InsightsPanel: mute + truncate + cancel so an interruption
         // doesn't leave two voices overlapping.
         if (msg.type === "input_audio_buffer.speech_started") {
+          // Reserve this question's position in the transcript the moment speech is detected —
+          // *before* transcription or any response exists. Fixed after live testing showed an
+          // off-topic question's instant rejection could still render ahead of the user's own
+          // turn: that turn used to only get pushed inside response.function_call_arguments.done,
+          // which never fires at all for an off-topic question (the model refuses directly, no
+          // tool call) — so the assistant's response had nothing to lose a race against. Content
+          // fills in once transcription completes (see conversation.item.input_audio_transcription
+          // .completed below); the turn's position in the list is locked in now, immediately.
+          pendingUserTurnId.current = addTurn({ role: "user", content: "" })
+
           activeAudioSourcesRef.current.forEach((source) => {
             try { source.stop() } catch { /* already finished naturally */ }
           })
@@ -333,7 +355,14 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
 
         if (msg.type === "conversation.item.input_audio_transcription.completed") {
           if (msg.transcript?.trim()) {
-            lastTranscriptRef.current = msg.transcript.trim()
+            const transcript = msg.transcript.trim()
+            lastTranscriptRef.current = transcript
+            // Fill in the placeholder reserved at speech_started — its position was already
+            // locked in, this only ever changes its content.
+            if (pendingUserTurnId.current) {
+              updateTurn(pendingUserTurnId.current, { content: transcript })
+              pendingUserTurnId.current = null
+            }
           }
         }
 
@@ -342,11 +371,10 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
           if (processedCallIds.current.has(callId)) return
           processedCallIds.current.add(callId)
 
+          // The user turn itself was already inserted at speech_started (see above) — this is
+          // just reading the transcript text for the tool-call fallback below, not adding a turn.
           const rawTranscript = lastTranscriptRef.current
-          if (rawTranscript) {
-            addTurn({ role: "user", content: rawTranscript })
-            lastTranscriptRef.current = ""
-          }
+          lastTranscriptRef.current = ""
 
           if (msg.name === "end_conversation") {
             if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -562,8 +590,11 @@ export function CompareVoiceButton({ compareData, firstName }: Props) {
           onScroll={handleTranscriptScroll}
           className="max-h-64 overflow-y-auto rounded-lg border bg-slate-50 p-3 space-y-2"
         >
-          {turns.map((turn, i) => (
-            <div key={i} className={`flex ${turn.role === "user" ? "justify-end" : "justify-start"}`}>
+          {/* A user placeholder reserved at speech_started can still be empty if transcription
+              never arrives (VAD false-positive, background noise) — filtered out here, not at
+              insertion time, so its reserved position in the array is unaffected either way. */}
+          {turns.filter((turn) => turn.content.trim().length > 0).map((turn) => (
+            <div key={turn.id} className={`flex ${turn.role === "user" ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-[85%] rounded-2xl px-3 py-2 text-xs leading-relaxed ${
                 turn.role === "user"
                   ? "bg-primary text-primary-foreground rounded-br-sm"
