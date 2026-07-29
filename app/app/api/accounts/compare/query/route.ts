@@ -99,6 +99,12 @@ about confidence/trends over time.
 Decide which of exactly three tiers the question falls into, and respond with ONLY a JSON object \
 of the shape {"tier": "answer" | "redirect" | "reject", "response": "..."} — no other text.
 
+Keep "response" concise and conversational — this is spoken aloud, not read. Even when a \
+question asks you to cover multiple things (e.g. "what else does this page talk about", which \
+should still mention all three capabilities below), keep each one to a short phrase or sentence \
+rather than a paragraph — a complete, brief answer is always better than a longer one that risks \
+being cut off.
+
 1. "answer" — the question is about what this Compare page itself offers:
    - Spend deltas or shared/unique categories: answer using ONLY the numbers in the provided \
 table data — never invent a number that isn't there.
@@ -209,12 +215,28 @@ export async function POST(request: Request) {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.3,
-      max_tokens: 300,
+      // Raised from 300 — a "describe all three capabilities" answer (see the "answer" tier's
+      // "what this page/feature can do" bullet) can routinely need more than 300 tokens, and a
+      // response cut off mid-sentence gets spoken back verbatim by the realtime voice model,
+      // producing an incomplete-sounding reply. The brevity instruction above keeps genuinely
+      // short answers short; this headroom is for the cases that legitimately cover more ground.
+      max_tokens: 500,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: buildUserContent(question, compareData, comparisonSnapshots) },
       ],
     })
+
+    if (completion.choices[0]?.finish_reason === "length") {
+      // Not fatal — still returns whatever text was generated — but worth surfacing, since a
+      // truncated mid-sentence answer is a real UX problem for a voice response, not a cosmetic one.
+      logError({
+        context: "compare.query.truncated",
+        error: new Error("Completion hit max_tokens before finishing — response may be cut off mid-sentence"),
+        userId: session.user.id,
+        question,
+      })
+    }
 
     const raw = completion.choices[0]?.message?.content ?? ""
     const result = parseTierResponse(raw)

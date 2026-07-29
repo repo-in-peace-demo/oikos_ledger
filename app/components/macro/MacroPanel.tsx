@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useMacro } from "@/lib/hooks/useMacro"
 import { formatCurrency } from "@/lib/currency"
+import { formatIndicatorValue } from "@/lib/macro/formatIndicator"
 import { InvestmentScenarioSlider, DEFAULT_RETURN } from "./InvestmentScenarioSlider"
 import { MacroVoiceButton, type MacroVoiceData } from "./MacroVoiceButton"
 import { MemoryPanel } from "./MemoryPanel"
@@ -21,14 +22,6 @@ const INDICATOR_EMOJI: Record<string, string> = {
   food_inflation: "🛒",
   gdp_growth: "📊",
   gdp_per_capita: "💰",
-}
-
-function formatValue(indicator: string, value: string): string {
-  const n = Number(value)
-  if (indicator === "gdp_per_capita") {
-    return `$${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`
-  }
-  return `${n.toFixed(2)}%`
 }
 
 interface Props {
@@ -165,7 +158,7 @@ export function MacroPanel({ firstName }: Props) {
                         {INDICATOR_LABELS[i.indicator] ?? i.indicator}
                       </div>
                       <p className="text-xl font-semibold text-slate-800">
-                        {formatValue(i.indicator, i.value)}
+                        {formatIndicatorValue(i.indicator, i.value)}
                       </p>
                       {i.indicator === "gdp_per_capita" && gdpPerCapitaAgeNote ? (
                         <p className="text-xs text-amber-600">{gdpPerCapitaAgeNote}</p>

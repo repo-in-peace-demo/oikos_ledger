@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useState, useRef, useCallback } from "react"
+import { useEffect, useState, useCallback } from "react"
 import { Mic, MicOff, X, ChevronDown, ChevronUp, Info } from "lucide-react"
 import { useAccounts } from "@/components/accounts/AccountsContext"
+import { useRealtimeVoiceSession } from "@/lib/voice/useRealtimeVoiceSession"
 import { RecommendationCard } from "./RecommendationCard"
 
 const VOICE_ENABLED = process.env.NEXT_PUBLIC_VOICE_ENABLED === "true"
@@ -77,24 +78,76 @@ export function RecommendationsPanel({ firstName }: RecommendationsPanelProps) {
   const [data, setData] = useState<RecommendationsResponse | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [isVoiceConnected, setIsVoiceConnected] = useState(false)
   const [showExplanation, setShowExplanation] = useState(false)
-  const [voiceStatus, setVoiceStatus] = useState<"idle" | "connecting" | "listening" | "speaking">("idle")
 
-  const wsRef = useRef<WebSocket | null>(null)
-  const audioContextRef = useRef<AudioContext | null>(null)
-  const processorRef = useRef<AudioWorkletNode | null>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-  const gainNodeRef = useRef<GainNode | null>(null)
-  const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([])
-  const lastAudioScheduledEndTimeRef = useRef<number>(0)
-  const currentAssistantItemId = useRef<string | null>(null)
-  const audioSamplesPlayed = useRef<number>(0)
-  const mutedItemId = useRef<string | null>(null)
-  const isResponseInProgress = useRef(false)
-  const awaitingFarewellResponse = useRef(false)
-  const shouldDisconnectAfterResponse = useRef(false)
-  const audioEnabledRef = useRef(false)
+  // The entire recommendations dataset + a guardrail-heavy system prompt (investment/tax/product-
+  // advice prohibitions) is baked into the session's instructions once, at connect time — there is
+  // no per-question tool call for content (only end_conversation is a defined tool), unlike
+  // Compare/Macro's ask_* tool pattern. Recomputed on every render so a connect that happens after
+  // data finishes loading picks up the real data (see useRealtimeVoiceSession's optionsRef, which
+  // reads the latest options on every render, not just at mount).
+  const voiceSystemPrompt = data
+    ? `You are a warm, knowledgeable personal finance assistant for Oikos Ledger, an AI-powered personal finance app.
+
+## Your role
+Help the user understand their spending patterns, explain the recommendations shown on screen, and suggest practical behavioural changes they can make.
+
+## User's current spending data
+${JSON.stringify(data.recommendations.map(r => ({
+  category: r.category,
+  baseline_monthly: Math.round(r.baseline_monthly),
+  current_spend: Math.round(r.current_spend),
+  projected_spend: Math.round(r.projected_spend),
+  variance: Math.round(r.variance),
+  top_merchants: r.top_merchants,
+  insight: r.insight,
+  action: r.action,
+})), null, 2)}
+${data.positive
+  ? `The user is on track across all discretionary categories and projected to save ₹${Math.round(data.total_savings).toLocaleString("en-IN")} this month.`
+  : ""}
+${data.is_stale
+  ? `Note: This data is from ${data.analysis_month}, the most recent uploaded month. The current month has no data yet.`
+  : ""}
+
+## What you CAN do
+- Explain overspending patterns in simple, conversational language
+- Reference specific merchants from the data to make advice concrete
+- Suggest practical day-to-day behavioural changes (e.g. reducing delivery orders, batch grocery shopping)
+- Help the user understand how their baseline and projections are calculated
+- Answer general questions about budgeting habits and spending hygiene
+- Provide positive reinforcement when the user is on track
+
+## What you MUST NOT do
+- Recommend specific stocks, mutual funds, ETFs, or any securities by name
+- Give tax advice, ITR filing guidance, or Section 80C/80D recommendations
+- Recommend specific banks, credit cards, insurance products, or financial apps
+- Ask for or repeat any account numbers, card details, or sensitive financial information
+- Claim to be a certified financial advisor, SEBI-registered advisor, or chartered accountant
+- Discuss topics unrelated to the user's personal spending and budgeting shown in this data
+- Make guarantees about financial outcomes
+
+## Guardrails
+- If asked for investment advice, say: "I can help with your spending patterns, but for investment decisions please consult a SEBI-registered financial advisor."
+- If asked for tax advice, say: "For tax-related questions, I'd recommend speaking with a chartered accountant."
+- If asked about anything outside personal spending and budgeting, politely redirect to the spending data shown.
+- Always clarify you are an AI assistant, not a human advisor, if directly asked.
+- Keep all amounts in Indian Rupee (₹).
+- Keep responses concise and conversational — this is a voice interaction.`
+    : `You are a personal finance assistant for Oikos Ledger.
+The user's recommendations are still loading.
+Only answer general budgeting and spending habit questions until the data is available.
+Do not give investment, tax, or product-specific advice.
+Keep responses brief — this is a voice interaction.`
+
+  const session = useRealtimeVoiceSession({
+    instructions: voiceSystemPrompt,
+    greetingInstructions: `Greet the user warmly by name in exactly one brief sentence. Address them as "${firstName || "there"}". Mention you can help them understand their spending recommendations.`,
+    // Gentler VAD tuning than Insights/Compare/Macro's shared defaults — a deliberate, pre-existing
+    // difference for this page, not something to silently flatten when adopting the shared hook.
+    vad: { threshold: 0.5, prefixPaddingMs: 300, silenceDurationMs: 800 },
+  })
+  const { isVoiceConnected, voiceStatus, connectVoice, disconnectVoice } = session
 
   const fetchRecommendations = useCallback(async (force = false) => {
     if (!selectedAccountId) return
@@ -156,379 +209,6 @@ export function RecommendationsPanel({ firstName }: RecommendationsPanelProps) {
       setIsLoading(false)
     }
   }, [selectedAccountId])
-
-  function stopMicCapture() {
-    processorRef.current?.disconnect()
-    processorRef.current = null
-    gainNodeRef.current?.disconnect()
-    gainNodeRef.current = null
-    audioContextRef.current?.close()
-    audioContextRef.current = null
-    streamRef.current?.getTracks().forEach((t: MediaStreamTrack) => t.stop())
-    streamRef.current = null
-  }
-
-  const disconnectVoice = useCallback(() => {
-    awaitingFarewellResponse.current = false
-    shouldDisconnectAfterResponse.current = false
-    wsRef.current?.close()
-    wsRef.current = null
-    stopMicCapture()
-    setIsVoiceConnected(false)
-    setVoiceStatus("idle")
-    audioEnabledRef.current = false
-  }, [])
-
-  async function startMicCapture(): Promise<{ workletNode: AudioWorkletNode } | null> {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-      })
-      streamRef.current = stream
-
-      const audioContext = new AudioContext({ sampleRate: 24000 })
-      audioContextRef.current = audioContext
-
-      const workletCode = `
-        class PCMProcessor extends AudioWorkletProcessor {
-          process(inputs) {
-            const input = inputs[0][0]
-            if (input) {
-              const pcm16 = new Int16Array(input.length)
-              for (let i = 0; i < input.length; i++) {
-                pcm16[i] = Math.max(-32768, Math.min(32767, input[i] * 32768))
-              }
-              this.port.postMessage(pcm16.buffer, [pcm16.buffer])
-            }
-            return true
-          }
-        }
-        registerProcessor('pcm-processor', PCMProcessor)
-      `
-
-      const blob = new Blob([workletCode], { type: "application/javascript" })
-      const url = URL.createObjectURL(blob)
-      await audioContext.audioWorklet.addModule(url)
-      URL.revokeObjectURL(url)
-
-      const source = audioContext.createMediaStreamSource(stream)
-      const workletNode = new AudioWorkletNode(audioContext, "pcm-processor")
-      processorRef.current = workletNode
-
-      source.connect(workletNode)
-      workletNode.connect(audioContext.destination)
-
-      const gainNode = audioContext.createGain()
-      gainNode.gain.value = 1
-      gainNode.connect(audioContext.destination)
-      gainNodeRef.current = gainNode
-
-      return { workletNode }
-    } catch (err) {
-      console.error("startMicCapture failed:", err)
-      return null
-    }
-  }
-
-  async function connectVoice() {
-    if (!selectedAccountId) return
-
-    setIsVoiceConnected(true)
-    setVoiceStatus("connecting")
-
-    const voiceSystemPrompt = data
-      ? `You are a warm, knowledgeable personal finance assistant for Oikos Ledger, an AI-powered personal finance app.
-
-## Your role
-Help the user understand their spending patterns, explain the recommendations shown on screen, and suggest practical behavioural changes they can make.
-
-## User's current spending data
-${JSON.stringify(data.recommendations.map(r => ({
-  category: r.category,
-  baseline_monthly: Math.round(r.baseline_monthly),
-  current_spend: Math.round(r.current_spend),
-  projected_spend: Math.round(r.projected_spend),
-  variance: Math.round(r.variance),
-  top_merchants: r.top_merchants,
-  insight: r.insight,
-  action: r.action,
-})), null, 2)}
-${data.positive
-  ? `The user is on track across all discretionary categories and projected to save ₹${Math.round(data.total_savings).toLocaleString("en-IN")} this month.`
-  : ""}
-${data.is_stale
-  ? `Note: This data is from ${data.analysis_month}, the most recent uploaded month. The current month has no data yet.`
-  : ""}
-
-## What you CAN do
-- Explain overspending patterns in simple, conversational language
-- Reference specific merchants from the data to make advice concrete
-- Suggest practical day-to-day behavioural changes (e.g. reducing delivery orders, batch grocery shopping)
-- Help the user understand how their baseline and projections are calculated
-- Answer general questions about budgeting habits and spending hygiene
-- Provide positive reinforcement when the user is on track
-
-## What you MUST NOT do
-- Recommend specific stocks, mutual funds, ETFs, or any securities by name
-- Give tax advice, ITR filing guidance, or Section 80C/80D recommendations
-- Recommend specific banks, credit cards, insurance products, or financial apps
-- Ask for or repeat any account numbers, card details, or sensitive financial information
-- Claim to be a certified financial advisor, SEBI-registered advisor, or chartered accountant
-- Discuss topics unrelated to the user's personal spending and budgeting shown in this data
-- Make guarantees about financial outcomes
-
-## Guardrails
-- If asked for investment advice, say: "I can help with your spending patterns, but for investment decisions please consult a SEBI-registered financial advisor."
-- If asked for tax advice, say: "For tax-related questions, I'd recommend speaking with a chartered accountant."
-- If asked about anything outside personal spending and budgeting, politely redirect to the spending data shown.
-- Always clarify you are an AI assistant, not a human advisor, if directly asked.
-- Keep all amounts in Indian Rupee (₹).
-- Keep responses concise and conversational — this is a voice interaction.`
-      : `You are a personal finance assistant for Oikos Ledger.
-The user's recommendations are still loading.
-Only answer general budgeting and spending habit questions until the data is available.
-Do not give investment, tax, or product-specific advice.
-Keep responses brief — this is a voice interaction.`
-
-    try {
-      const micPromise = startMicCapture()
-
-      const tokenRes = await fetch("/api/insights/session", { method: "POST" })
-      if (!tokenRes.ok) throw new Error("Failed to get session token")
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { client_secret } = await tokenRes.json() as { client_secret: any }
-
-      let nextAudioStartTime = 0
-
-      const ws = new WebSocket(
-        "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
-        [
-          "realtime",
-          `openai-insecure-api-key.${client_secret.value}`,
-        ],
-      )
-
-      ws.onopen = async () => {
-        setVoiceStatus("listening")
-        audioEnabledRef.current = true
-
-        ws.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            type: "realtime",
-            audio: {
-              input: {
-                transcription: { model: "gpt-realtime-whisper" },
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 800,
-                  interrupt_response: true,
-                  create_response: true,
-                },
-              },
-              output: { voice: "shimmer" },
-            },
-            tools: [
-              {
-                type: "function",
-                name: "end_conversation",
-                description: `Call this tool immediately when the user indicates they are done. Trigger phrases include: "no", "that is all", "nothing else", "i'm done", "no more", "goodbye", "bye", "nope", "all good", "that's it", "no thank you", "no thanks", or any similar closing response. Do NOT ask a follow-up question first.`,
-                parameters: { type: "object", properties: {} },
-              },
-            ],
-            tool_choice: "auto",
-            instructions: voiceSystemPrompt,
-          },
-        }))
-
-        try {
-          const streamData = await micPromise
-          if (streamData) {
-            streamData.workletNode.port.onmessage = (e) => {
-              if (ws.readyState !== WebSocket.OPEN) return
-              const buffer = e.data as ArrayBuffer
-              const bytes = new Uint8Array(buffer)
-              let binary = ""
-              for (let i = 0; i < bytes.byteLength; i++) {
-                binary += String.fromCharCode(bytes[i])
-              }
-              ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: btoa(binary) }))
-            }
-          }
-
-          if (!audioContextRef.current) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
-            audioContextRef.current = new AudioContextClass({ sampleRate: 24000 })
-          }
-          if (audioContextRef.current.state === "suspended") {
-            await audioContextRef.current.resume()
-          }
-
-          ws.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "Hello! I'm ready to discuss my spending recommendations." }],
-            },
-          }))
-          ws.send(JSON.stringify({
-            type: "response.create",
-            response: { instructions: `Greet the user warmly by name in exactly one brief sentence. Address them as "${firstName || "there"}". Mention you can help them understand their spending recommendations.` },
-          }))
-          isResponseInProgress.current = true
-        } catch (err) {
-          console.error("Voice handshake failed:", err)
-          disconnectVoice()
-        }
-      }
-
-      ws.onmessage = async (event) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const msg = JSON.parse(event.data as string) as any
-
-        if (msg.type === "response.created") {
-          isResponseInProgress.current = true
-          if (gainNodeRef.current) gainNodeRef.current.gain.value = 1
-        }
-
-        if (msg.type === "response.done") {
-          isResponseInProgress.current = false
-
-          if (awaitingFarewellResponse.current) {
-            awaitingFarewellResponse.current = false
-            shouldDisconnectAfterResponse.current = true
-          }
-
-          if (shouldDisconnectAfterResponse.current) {
-            shouldDisconnectAfterResponse.current = false
-            const now = audioContextRef.current ? audioContextRef.current.currentTime : 0
-            const remainingMs = Math.max(0, (lastAudioScheduledEndTimeRef.current - now) * 1000)
-            setTimeout(() => disconnectVoice(), remainingMs + 800)
-          } else {
-            setVoiceStatus("listening")
-          }
-        }
-
-        if (msg.type === "input_audio_buffer.speech_started") {
-          setVoiceStatus("listening")
-
-          activeAudioSourcesRef.current.forEach(source => {
-            try { source.stop() } catch { /* already ended */ }
-          })
-          activeAudioSourcesRef.current = []
-
-          if (audioContextRef.current) {
-            nextAudioStartTime = audioContextRef.current.currentTime
-            lastAudioScheduledEndTimeRef.current = audioContextRef.current.currentTime
-            audioSamplesPlayed.current = 0
-          }
-          if (gainNodeRef.current) gainNodeRef.current.gain.value = 0
-          mutedItemId.current = currentAssistantItemId.current
-
-          if (wsRef.current?.readyState === WebSocket.OPEN && isResponseInProgress.current) {
-            const playedMs = Math.round((audioSamplesPlayed.current / 24000) * 1000)
-            if (currentAssistantItemId.current) {
-              wsRef.current.send(JSON.stringify({
-                type: "conversation.item.truncate",
-                item_id: currentAssistantItemId.current,
-                content_index: 0,
-                audio_end_ms: playedMs,
-              }))
-            }
-            wsRef.current.send(JSON.stringify({ type: "response.cancel" }))
-            isResponseInProgress.current = false
-          }
-        }
-
-        if (msg.type === "response.function_call_arguments.done") {
-          const callId = msg.call_id as string
-
-          if (msg.name === "end_conversation") {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(JSON.stringify({
-                type: "conversation.item.create",
-                item: {
-                  type: "function_call_output",
-                  call_id: callId,
-                  output: JSON.stringify({ success: true }),
-                },
-              }))
-              wsRef.current.send(JSON.stringify({ type: "response.create" }))
-              isResponseInProgress.current = true
-            }
-            setTimeout(() => { awaitingFarewellResponse.current = true }, 300)
-          }
-        }
-
-        if (msg.type === "response.output_item.added") {
-          if (msg.item?.role === "assistant") {
-            currentAssistantItemId.current = msg.item.id as string
-            audioSamplesPlayed.current = 0
-            mutedItemId.current = null
-          }
-        }
-
-        if (msg.type === "response.output_audio.delta" && audioContextRef.current) {
-          if (!audioEnabledRef.current) return
-          if (msg.item_id && msg.item_id === mutedItemId.current) return
-
-          setVoiceStatus("speaking")
-          const audioBuffer = Uint8Array.from(atob(msg.delta as string), c => c.charCodeAt(0)).buffer
-          const pcmData = new Int16Array(audioBuffer)
-          const float32Data = new Float32Array(pcmData.length)
-          for (let i = 0; i < pcmData.length; i++) {
-            float32Data[i] = pcmData[i] / 32768.0
-          }
-          audioSamplesPlayed.current += float32Data.length
-
-          const ctx = audioContextRef.current
-          const buffer = ctx.createBuffer(1, float32Data.length, 24000)
-          buffer.copyToChannel(float32Data, 0)
-
-          const source = ctx.createBufferSource()
-          source.buffer = buffer
-          source.connect(gainNodeRef.current ?? ctx.destination)
-
-          const startTime = Math.max(ctx.currentTime, nextAudioStartTime)
-          source.start(startTime)
-          nextAudioStartTime = startTime + buffer.duration
-          lastAudioScheduledEndTimeRef.current = nextAudioStartTime
-
-          activeAudioSourcesRef.current.push(source)
-          source.onended = () => {
-            activeAudioSourcesRef.current = activeAudioSourcesRef.current.filter(s => s !== source)
-          }
-        }
-
-        if (msg.type === "error") {
-          if (msg.error?.code === "response_cancel_not_active") return
-          console.error("Realtime API error:", msg.error)
-          setError(`Voice error: ${msg.error?.message}`)
-        }
-      }
-
-      ws.onerror = () => {
-        setError("Voice connection error. Please try again.")
-        disconnectVoice()
-      }
-
-      ws.onclose = () => {
-        setIsVoiceConnected(false)
-        setVoiceStatus("idle")
-        stopMicCapture()
-      }
-
-      wsRef.current = ws
-    } catch {
-      setError("Failed to connect voice. Please try again.")
-      setVoiceStatus("idle")
-      setIsVoiceConnected(false)
-    }
-  }
 
   if (!selectedAccountId) {
     return (

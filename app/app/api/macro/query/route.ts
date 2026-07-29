@@ -16,6 +16,8 @@
 // bypassed its own page's cache and needed a follow-up fix.
 import { auth } from "@/auth"
 import { type MacroFactRow, loadMacroFacts } from "@/lib/macro/balanceFacts"
+import { formatIndicatorValue } from "@/lib/macro/formatIndicator"
+import { formatCurrency } from "@/lib/currency"
 import { logError } from "@/lib/logger"
 import OpenAI from "openai"
 
@@ -118,14 +120,26 @@ things — always use the memory facts, never a guess, when the question is abou
 Decide which of exactly three tiers the question falls into, and respond with ONLY a JSON object \
 of the shape {"tier": "answer" | "redirect" | "reject", "response": "..."} — no other text.
 
+Keep "response" concise and conversational — this is spoken aloud, not read. Even when a \
+question asks you to cover multiple things (e.g. "what else does this page talk about", which \
+should still mention all four capabilities below), keep each one to a short phrase or sentence \
+rather than a paragraph — a complete, brief answer is always better than a longer one that risks \
+being cut off.
+
 1. "answer" — the question is about what this Macro page itself offers:
-   - Indicator values (GDP growth, inflation, GDP per capita, repo rate): answer using ONLY the \
-numbers in the provided data — never invent a number that isn't there.
+   - Indicator values (GDP growth, inflation, GDP per capita, repo rate): each indicator in the \
+provided data includes a pre-formatted "display_value" string — always state that string \
+verbatim, never reconstruct the number or its unit/currency symbol yourself. GDP per capita is a \
+US-dollar figure from World Bank data ("$" — always, regardless of the user's own account \
+currency shown elsewhere); GDP growth, inflation, food inflation, and the repo rate are all \
+percentages ("%"). Never invent a number that isn't in the provided data, and never apply the \
+user's own account currency (shown separately for balance/scenario figures) to GDP per capita or \
+any percentage indicator.
    - The erosion/purchasing-power synthesis, or the GDP-vs-erosion comparison: answer using the \
 provided explanation text and indicator values directly.
-   - The scenario slider's what-if math: answer using the provided amount, assumed_return, and \
-the precomputed net_annual_benefit figure — never attempt your own arithmetic, use the number \
-given.
+   - The scenario slider's what-if math, or the user's own account balance figures: these ARE in \
+the user's own account currency (see the balances/scenario data's pre-formatted "_display" \
+strings) — use those verbatim, never attempt your own arithmetic or currency conversion.
    - What the app remembers/recalls/has noticed about the user's balance trend, or confidence/ \
 trends over time: answer ONLY from the provided memory facts, never invented. Always state both \
 the result and its confidence in one natural sentence: confidence_status "confirmed" (usually a \
@@ -168,12 +182,46 @@ function buildUserContent(
   macroData: MacroData,
   facts: MacroFactRow[],
 ): string {
-  const { scenario, ...pageData } = macroData
+  const { scenario, balances, indicators, ...restPageData } = macroData
   const { inflation_rate, net_annual_benefit } = computeScenarioNetBenefit(macroData)
+
+  // Pre-formatted with the correct unit/currency per indicator (GDP per capita is always $, the
+  // rest are %) — the same formatIndicatorValue the visual card itself uses, so the model is never
+  // left to reconstruct a symbol from a bare number and the user's own (unrelated) account
+  // currency sitting elsewhere in this same payload. See lib/macro/formatIndicator.ts.
+  const indicatorsWithDisplay = indicators.map((i) => ({
+    ...i,
+    display_value: formatIndicatorValue(i.indicator, i.value),
+  }))
+
+  // Balance figures ARE in the user's own account currency — pre-formatted the same way, so the
+  // model relays a ready-made string instead of guessing which currency applies where.
+  const balancesWithDisplay = {
+    ...balances,
+    combined_balance_display: balances.combined_balance != null
+      ? formatCurrency(balances.combined_balance, macroData.currency)
+      : null,
+    accounts: balances.accounts.map((a) => ({
+      ...a,
+      closing_balance_display: formatCurrency(a.closing_balance, macroData.currency),
+    })),
+  }
+
+  const pageData = { ...restPageData, indicators: indicatorsWithDisplay, balances: balancesWithDisplay }
+
   return `Question: ${question}\n\n`
     + `Current Macro page data:\n${JSON.stringify(pageData, null, 2)}\n\n`
-    + `Scenario slider (current live values, server-computed net benefit):\n`
-    + `${JSON.stringify({ ...scenario, inflation_rate, net_annual_benefit }, null, 2)}\n\n`
+    + `Scenario slider (current live values, server-computed net benefit, pre-formatted in the \
+user's own account currency):\n`
+    + `${JSON.stringify({
+      ...scenario,
+      inflation_rate,
+      net_annual_benefit,
+      amount_display: formatCurrency(scenario.amount, macroData.currency),
+      net_annual_benefit_display: net_annual_benefit != null
+        ? formatCurrency(net_annual_benefit, macroData.currency)
+        : null,
+    }, null, 2)}\n\n`
     + `Balance trend memory facts (freshly queried, confidence-scored):\n`
     + `${JSON.stringify(facts, null, 2)}`
 }
@@ -231,12 +279,28 @@ export async function POST(request: Request) {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.3,
-      max_tokens: 300,
+      // Raised from 300 — a "describe all four capabilities" answer (see the "answer" tier's
+      // "what this page/feature can do" bullet) routinely needed more than 300 tokens, and a
+      // response cut off mid-sentence gets spoken back verbatim by the realtime voice model,
+      // producing an incomplete-sounding reply. The brevity instruction above keeps genuinely
+      // short answers short; this headroom is for the cases that legitimately cover more ground.
+      max_tokens: 500,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: buildUserContent(question, macroData, facts) },
       ],
     })
+
+    if (completion.choices[0]?.finish_reason === "length") {
+      // Not fatal — still returns whatever text was generated — but worth surfacing, since a
+      // truncated mid-sentence answer is a real UX problem for a voice response, not a cosmetic one.
+      logError({
+        context: "macro.query.truncated",
+        error: new Error("Completion hit max_tokens before finishing — response may be cut off mid-sentence"),
+        userId: session.user.id,
+        question,
+      })
+    }
 
     const raw = completion.choices[0]?.message?.content ?? ""
     const result = parseTierResponse(raw)
