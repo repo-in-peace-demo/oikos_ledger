@@ -3,24 +3,30 @@
 // Client-side "what if" tool — pure arithmetic on values already returned by /api/macro. No API
 // call, and deliberately not logged as an episodic_events row: this is a hypothetical the user is
 // exploring, not a fact about them.
-import { useState } from "react"
+//
+// Amount/assumedReturn are controlled (lifted to MacroPanel), not local state — MacroVoiceButton
+// needs read access to whatever the user currently has the slider set to, so a voice question
+// like "what if I invested it at 8%" answers against what's actually on screen right now, not a
+// component-local default it can't see.
 import { formatCurrency, getCurrencySymbol } from "@/lib/currency"
 
-const MIN_RETURN = 3
-const MAX_RETURN = 9
-const DEFAULT_RETURN = 6
+export const MIN_RETURN = 3
+export const MAX_RETURN = 9
+export const DEFAULT_RETURN = 6
 const RETURN_STEP = 0.5
 
 interface Props {
-  defaultAmount: number
+  amount: number
+  onAmountChange: (amount: number) => void
+  assumedReturn: number
+  onAssumedReturnChange: (assumedReturn: number) => void
   inflationRate: number
   currencyCode: string
 }
 
-export function InvestmentScenarioSlider({ defaultAmount, inflationRate, currencyCode }: Props) {
-  const [amount, setAmount] = useState(Math.max(0, Math.round(defaultAmount)))
-  const [assumedReturn, setAssumedReturn] = useState(DEFAULT_RETURN)
-
+export function InvestmentScenarioSlider({
+  amount, onAmountChange, assumedReturn, onAssumedReturnChange, inflationRate, currencyCode,
+}: Props) {
   const netAnnualBenefit = amount * (assumedReturn / 100) - amount * (inflationRate / 100)
   const isGain = netAnnualBenefit >= 0
 
@@ -40,7 +46,7 @@ export function InvestmentScenarioSlider({ defaultAmount, inflationRate, currenc
             type="number"
             min={0}
             value={amount}
-            onChange={(e) => setAmount(Math.max(0, Math.round(Number(e.target.value) || 0)))}
+            onChange={(e) => onAmountChange(Math.max(0, Math.round(Number(e.target.value) || 0)))}
             className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm
               focus:outline-none focus:ring-1 focus:ring-ring"
           />
@@ -56,7 +62,7 @@ export function InvestmentScenarioSlider({ defaultAmount, inflationRate, currenc
             max={MAX_RETURN}
             step={RETURN_STEP}
             value={assumedReturn}
-            onChange={(e) => setAssumedReturn(Number(e.target.value))}
+            onChange={(e) => onAssumedReturnChange(Number(e.target.value))}
             className="w-full accent-primary"
           />
           <div className="flex justify-between text-[10px] text-muted-foreground">

@@ -10,6 +10,7 @@ import { getUserById } from "@/lib/db/queries/users"
 import { generateEmbedding } from "@/lib/embeddings"
 import { formatCurrency } from "@/lib/currency"
 import { DEFAULT_CURRENCY } from "@/lib/constants/currencies"
+import { type MacroFactRow, loadMacroFacts } from "@/lib/macro/balanceFacts"
 import { mcpSelectQuery } from "@/lib/mcp/client"
 
 export const dynamic = "force-dynamic"
@@ -37,17 +38,6 @@ type MacroIndicatorRow = {
   period: string
   value: string
   source: string
-}
-
-type SemanticFactRow = {
-  id: string
-  fact_type: string
-  category: string | null
-  description: string
-  relevance_score: number
-  confidence_status: string
-  occurrence_count: number
-  updated_at: string
 }
 
 type BlendState = "blended_clean" | "blended_with_caveat" | "not_blended"
@@ -80,13 +70,6 @@ const INDICATOR_LABELS: Record<string, string> = {
 // The four indicators macro_fetch.py actually populates (food_inflation is deliberately
 // unmapped — see ingestion/sources/macro_fetch.py — so it's never "missing", just untracked).
 const CORE_INDICATORS = ["gdp_growth", "gdp_per_capita", "inflation", "repo_rate"] as const
-
-// Allow-list, not a block-list: only fact_types that belong on the Macro page's memory panel.
-// account_id-scoped facts (e.g. Compare's "category_baseline") are excluded by the account_id
-// IS NULL filter below regardless, but this allow-list also keeps out any future user-level
-// fact_type that isn't macro-relevant. Add new macro-relevant types here as they're built
-// (e.g. a future "trend:repo_rate_snapshot").
-const MACRO_RELEVANT_FACT_TYPES = ["trend:balance_snapshot"] as const
 
 function buildExplanationKey(indicators: MacroIndicatorRow[]): string {
   return indicators
@@ -194,7 +177,7 @@ function inflationErosionSentence(
 
 function composeMacroExplanation(
   indicators: MacroIndicatorRow[],
-  facts: SemanticFactRow[],
+  facts: MacroFactRow[],
   balances: BalancesSummary,
   currencyCode: string,
 ): string {
@@ -340,29 +323,18 @@ export async function GET() {
   const user = await getUserById(userId)
   const currencyCode = user?.currency ?? DEFAULT_CURRENCY
 
-  // Only fact_types on the MACRO_RELEVANT_FACT_TYPES allow-list — this is a user-level memory
-  // panel (account_id IS NULL), and without the allow-list it would also surface unrelated
-  // user-level fact_types as they get added elsewhere. If none exist yet (the common case
-  // today), the query just returns empty and the synthesis reads naturally without forcing a
+  // Only fact_types on the MACRO_RELEVANT_FACT_TYPES allow-list (see loadMacroFacts) — this is a
+  // user-level memory panel (account_id IS NULL), and without the allow-list it would also surface
+  // unrelated user-level fact_types as they get added elsewhere. If none exist yet (the common
+  // case today), the query just returns empty and the synthesis reads naturally without forcing a
   // reference.
-  let facts: SemanticFactRow[] = []
+  let facts: MacroFactRow[] = []
   let alreadyExplained = false
   // Defaults to true (record) rather than false — if the MCP throttle check below fails, we'd
   // rather risk one extra snapshot than silently drop real balance data for this visit.
   let shouldRecordSnapshot = true
   try {
-    const factTypeList = MACRO_RELEVANT_FACT_TYPES.map((t) => `'${t}'`).join(", ")
-    facts = await mcpSelectQuery<SemanticFactRow>(`
-      SELECT id, fact_type, category, description, relevance_score, confidence_status,
-        occurrence_count, updated_at
-      FROM semantic_facts
-      WHERE user_id = '${userId}'
-        AND account_id IS NULL
-        AND fact_type IN (${factTypeList})
-        AND superseded_by IS NULL
-      ORDER BY relevance_score DESC
-      LIMIT 5
-    `)
+    facts = await loadMacroFacts(userId)
 
     // This is scoped to the exact indicator/period combo — used only to decide phrasing below,
     // never gates whether a snapshot is recorded.
