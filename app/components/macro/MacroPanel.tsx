@@ -1,9 +1,10 @@
 "use client"
 
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useMacro } from "@/lib/hooks/useMacro"
 import { formatCurrency } from "@/lib/currency"
-import { InvestmentScenarioSlider } from "./InvestmentScenarioSlider"
+import { InvestmentScenarioSlider, DEFAULT_RETURN } from "./InvestmentScenarioSlider"
+import { MacroVoiceButton, type MacroVoiceData } from "./MacroVoiceButton"
 import { MemoryPanel } from "./MemoryPanel"
 
 const INDICATOR_LABELS: Record<string, string> = {
@@ -30,7 +31,11 @@ function formatValue(indicator: string, value: string): string {
   return `${n.toFixed(2)}%`
 }
 
-export function MacroPanel() {
+interface Props {
+  firstName?: string
+}
+
+export function MacroPanel({ firstName }: Props) {
   const {
     indicators, facts, explanation, balances, currency, lastDistilledAt,
     gdpPerCapitaAgeNote, repoRateUnchangedNote,
@@ -41,6 +46,31 @@ export function MacroPanel() {
   const hasIndicators = indicators.length > 0
   const hasRealityContent = hasBalanceInfo || (hasIndicators && !!explanation)
   const inflationIndicator = indicators.find((i) => i.indicator === "inflation")
+
+  // Lifted out of InvestmentScenarioSlider (which used to own this as local state) so
+  // MacroVoiceButton can read the slider's live values — a voice question like "what if I
+  // invested it at 8%" needs to answer against what's actually on screen, not a default it can't
+  // see. Initialized once, lazily, the same moment the slider itself used to initialize via
+  // defaultAmount — not reset on every subsequent balances refresh, which would clobber whatever
+  // the user has since typed in.
+  const [scenarioAmount, setScenarioAmount] = useState(0)
+  const [scenarioAssumedReturn, setScenarioAssumedReturn] = useState(DEFAULT_RETURN)
+  const scenarioInitialized = useRef(false)
+  useEffect(() => {
+    if (scenarioInitialized.current) return
+    if (balances.combined_balance != null) {
+      setScenarioAmount(Math.max(0, Math.round(balances.combined_balance)))
+      scenarioInitialized.current = true
+    }
+  }, [balances.combined_balance])
+
+  const macroVoiceData: MacroVoiceData | null = (!isLoading && !isError && hasIndicators)
+    ? {
+        indicators, explanation, balances, currency,
+        gdpPerCapitaAgeNote, repoRateUnchangedNote,
+        scenarioAmount, scenarioAssumedReturn,
+      }
+    : null
 
   // Fire-and-forget cache/cluster warm-up (see the prefetch branch in
   // /api/insights/query/route.ts for the full rationale and its honest-scope caveat). Macro
@@ -106,6 +136,8 @@ export function MacroPanel() {
           </div>
         ) : (
           <>
+            <MacroVoiceButton macroData={macroVoiceData} firstName={firstName} />
+
             {/* Context — the economic backdrop, national data, not specific to you */}
             <section className="space-y-4">
               <div className="space-y-1">
@@ -249,7 +281,10 @@ export function MacroPanel() {
                   <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">What you can do about it</p>
                 </div>
                 <InvestmentScenarioSlider
-                  defaultAmount={balances.combined_balance ?? 0}
+                  amount={scenarioAmount}
+                  onAmountChange={setScenarioAmount}
+                  assumedReturn={scenarioAssumedReturn}
+                  onAssumedReturnChange={setScenarioAssumedReturn}
                   inflationRate={Number(inflationIndicator.value)}
                   currencyCode={currency}
                 />
