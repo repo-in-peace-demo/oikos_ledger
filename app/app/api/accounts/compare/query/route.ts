@@ -5,24 +5,25 @@
 // shared/unique categories, comparison_snapshot facts and their confidence). There is no SQL
 // generation or tool-calling loop for the table-shaped data (category_deltas, shared/unique
 // categories) since the caller already has it — but confidence-scored memory
-// (comparison_snapshot facts) is NOT taken from the caller. See fetchComparisonSnapshots below.
+// (comparison_snapshot facts) is NOT taken from the caller. See below.
 //
-// CONFIRMED BUG (fixed here): an earlier version of this route trusted a `comparison_snapshots`
-// field inside the client-forwarded compare_data JSON instead of querying semantic_facts itself.
-// Live testing showed "what does the app recall?" answered from raw category totals, not
-// confidence-aware memory — because the model had no independent, emphasized memory data to draw
-// on, only an easily-ignored array buried inside the same JSON blob as the raw table numbers. This
-// route now runs its own MCP query for trend:comparison_snapshot facts on every request (mirrors
-// loadComparisonSnapshots' exact query shape in ../route.ts — that function is private to its
-// file and its cache/marker logic is intertwined with the rest of that route, so this duplicates
-// the query rather than importing it, matching the same reasoning `distiller.py` already
-// documents for other duplicated-but-simple read shapes). category_deltas/shared_categories/
-// unique_categories are still taken from the client's compare_data — those are just the current
-// table's computed values, not a "memory" claim, so re-querying them independently wouldn't change
-// anything a fresh MCP call couldn't already guarantee for the one thing that actually needed it.
+// CONFIRMED BUG (fixed previously): an earlier version of this route trusted a
+// `comparison_snapshots` field inside the client-forwarded compare_data JSON instead of querying
+// semantic_facts itself. Live testing showed "what does the app recall?" answered from raw
+// category totals, not confidence-aware memory.
+//
+// CONFIRMED GAP (fixed here): the fix for the bug above then ran its own fresh, uncached MCP query
+// on every single question — bypassing the marker-based cache already proven for this exact query
+// shape on the Compare page itself (app/app/api/accounts/compare/route.ts), worse for voice
+// specifically given the Realtime API's sub-second response design goal (ADR 013). Both routes now
+// import loadComparisonSnapshots from app/lib/compare/comparisonSnapshots.ts — one cached read
+// path, not two independently-evolving copies of the same query. category_deltas/
+// shared_categories/unique_categories are still taken from the client's compare_data — those are
+// just the current table's computed values, not a "memory" claim, so caching them here separately
+// wouldn't add anything the page's own cache doesn't already cover.
 import { auth } from "@/auth"
+import { loadComparisonSnapshots, type ComparisonSnapshotRow } from "@/lib/compare/comparisonSnapshots"
 import { logError } from "@/lib/logger"
-import { mcpSelectQuery } from "@/lib/mcp/client"
 import OpenAI from "openai"
 
 export const dynamic = "force-dynamic"
@@ -32,17 +33,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 })
 
-// Same fact_type constant as distillation/pipeline/distiller.py and ../route.ts.
-const COMPARISON_SNAPSHOT_FACT_TYPE = "trend:comparison_snapshot"
-
-type ComparisonSnapshot = {
-  id: string
-  category: string
-  description: string
-  occurrence_count: number
-  confidence_status: string
-  updated_at: string
-}
+type ComparisonSnapshot = ComparisonSnapshotRow
 
 type CategoryDelta = {
   category: string
@@ -65,27 +56,6 @@ type CompareData = {
 }
 
 type Tier = "answer" | "redirect" | "reject"
-
-// Same MCP read path as loadComparisonSnapshots in ../route.ts — user_id-scoped, so even if a
-// caller passed account_ids that aren't actually theirs, the user_id filter means no other user's
-// facts could ever match.
-async function fetchComparisonSnapshots(
-  userId: string,
-  accountIds: string[],
-): Promise<ComparisonSnapshot[]> {
-  if (accountIds.length === 0) return []
-  const idList = accountIds.map((id) => `'${id}'`).join(",")
-  return mcpSelectQuery<ComparisonSnapshot>(`
-    SELECT id, category, description, occurrence_count, confidence_status, updated_at
-    FROM semantic_facts
-    WHERE user_id = '${userId}'
-      AND fact_type = '${COMPARISON_SNAPSHOT_FACT_TYPE}'
-      AND superseded_by IS NULL
-      AND account_id IN (${idList})
-      AND compared_account_id IN (${idList})
-    ORDER BY updated_at DESC
-  `)
-}
 
 // Mirrors distillation/config.py's settings.min_occurrences_for_trend — a Python-side constant
 // this TS route can't import directly (separate runtime/deployment from the distillation Lambda).
@@ -222,14 +192,14 @@ export async function POST(request: Request) {
   let comparisonSnapshots: ComparisonSnapshot[] = []
   try {
     const accountIds = compareData.accounts.map((a) => a.account_id)
-    comparisonSnapshots = await fetchComparisonSnapshots(session.user.id, accountIds)
+    comparisonSnapshots = await loadComparisonSnapshots(session.user.id, accountIds)
   } catch (err) {
     // Degrades to "no memory facts yet" rather than failing the whole answer — same posture as
     // every other best-effort MCP read in this codebase (e.g. /api/macro's "MCP memory lookup
     // failed, degrading to indicators-only"). The model is still told explicitly (via the empty
     // array) not to fall back to raw totals when asked a memory question.
     logError({
-      context: "compare.query.fetchComparisonSnapshots",
+      context: "compare.query.loadComparisonSnapshots",
       error: err,
       userId: session.user.id,
     })
