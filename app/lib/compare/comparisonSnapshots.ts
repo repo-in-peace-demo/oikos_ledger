@@ -90,8 +90,29 @@ export async function loadComparisonSnapshots(
 
   const cached = comparisonSnapshotCache.get(cacheKey)
   if (cached && cached.marker === marker) {
+    console.log(JSON.stringify({
+      level: "info",
+      timestamp: new Date().toISOString(),
+      context: "loadComparisonSnapshots.cache",
+      event: "HIT",
+      userId,
+      accountIds,
+      marker,
+    }))
     return cached.data
   }
+
+  console.log(JSON.stringify({
+    level: "info",
+    timestamp: new Date().toISOString(),
+    context: "loadComparisonSnapshots.cache",
+    event: "MISS",
+    reason: !cached ? "no_cached_entry" : "marker_mismatch",
+    userId,
+    accountIds,
+    marker,
+    cachedMarker: cached?.marker ?? null,
+  }))
 
   const idList = accountIds.map((id) => `'${id}'`).join(",")
   const data = await mcpSelectQuery<ComparisonSnapshotRow>(`
