@@ -133,12 +133,14 @@ ${data.is_stale
 - If asked about anything outside personal spending and budgeting, politely redirect to the spending data shown.
 - Always clarify you are an AI assistant, not a human advisor, if directly asked.
 - Keep all amounts in Indian Rupee (₹).
-- Keep responses concise and conversational — this is a voice interaction.`
+- Keep responses concise and conversational — this is a voice interaction.
+- When speaking monetary amounts, percentages, and other numeric figures, pronounce them the way a person would say them naturally in conversation (e.g. "seven hundred forty-nine thousand rupees", not digit-by-digit), not written/formatted the way they'd appear on screen.`
     : `You are a personal finance assistant for Oikos Ledger.
 The user's recommendations are still loading.
 Only answer general budgeting and spending habit questions until the data is available.
 Do not give investment, tax, or product-specific advice.
-Keep responses brief — this is a voice interaction.`
+Keep responses brief — this is a voice interaction.
+When speaking monetary amounts, percentages, and other numeric figures, pronounce them the way a person would say them naturally in conversation (e.g. "seven hundred forty-nine thousand rupees", not digit-by-digit), not written/formatted the way they'd appear on screen.`
 
   const session = useRealtimeVoiceSession({
     instructions: voiceSystemPrompt,
