@@ -115,8 +115,29 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
 
   const cached = accountMemoryCache.get(cacheKey)
   if (cached && cached.marker === marker) {
+    console.log(JSON.stringify({
+      level: "info",
+      timestamp: new Date().toISOString(),
+      context: "loadAccountMemory.cache",
+      event: "HIT",
+      userId,
+      accountId,
+      marker,
+    }))
     return cached.data
   }
+
+  console.log(JSON.stringify({
+    level: "info",
+    timestamp: new Date().toISOString(),
+    context: "loadAccountMemory.cache",
+    event: "MISS",
+    reason: !cached ? "no_cached_entry" : "marker_mismatch",
+    userId,
+    accountId,
+    marker,
+    cachedMarker: cached?.marker ?? null,
+  }))
 
   const [events, facts] = await Promise.all([
     mcpSelectQuery<EpisodicEventRow>(`
