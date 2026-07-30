@@ -2,6 +2,8 @@
 
 import { useState } from "react"
 import type { BankAccount } from "@/types"
+import { confidenceCardClassName } from "@/lib/memoryCardStyle"
+import { highlightText } from "@/lib/highlightText"
 import { CompareVoiceButton } from "./CompareVoiceButton"
 
 interface CategoryDelta {
@@ -293,21 +295,35 @@ export function ComparePanel({ accounts, firstName }: ComparePanelProps) {
               </p>
             ) : (
               <div className="space-y-2">
-                {data.comparison_snapshots.map((f) => (
-                  <div key={f.id} className="flex items-start gap-2 rounded-lg border bg-slate-50 px-3 py-2 text-xs">
-                    <span className="shrink-0" title={f.confidence_status}>
-                      {f.confidence_status === "confirmed" ? "✅" : "🤔"}
-                    </span>
-                    <div className="flex-1 space-y-1">
-                      <p className="text-slate-700">{f.description}</p>
-                      <p className="text-muted-foreground">
-                        {f.confidence_status === "confirmed" ? "Confirmed" : "Tentative"}
-                        {" · seen "}{f.occurrence_count} time{f.occurrence_count === 1 ? "" : "s"}
-                        {" · updated "}{formatDate(f.updated_at)}
-                      </p>
+                {(() => {
+                  // Same palette/assignment as the Category spend deltas table above
+                  // (colorForAccount) — computed once here since it doesn't depend on which fact
+                  // is being rendered, just which two accounts are being compared.
+                  const bankHighlights = data.accounts
+                    .map((a) => {
+                      const account = accounts.find((acc) => acc.id === a.account_id)
+                      return account
+                        ? { text: account.bank_name, className: colorForAccount(data.accounts, a.account_id) }
+                        : null
+                    })
+                    .filter((h): h is { text: string; className: string } => h !== null)
+
+                  return data.comparison_snapshots.map((f) => (
+                    <div key={f.id} className={confidenceCardClassName(f.confidence_status)}>
+                      <span className="shrink-0" title={f.confidence_status}>
+                        {f.confidence_status === "confirmed" ? "✅" : "🤔"}
+                      </span>
+                      <div className="flex-1 space-y-1">
+                        <p className="text-slate-700">{highlightText(f.description, bankHighlights)}</p>
+                        <p className="text-muted-foreground">
+                          {f.confidence_status === "confirmed" ? "Confirmed" : "Tentative"}
+                          {" · seen "}{f.occurrence_count} time{f.occurrence_count === 1 ? "" : "s"}
+                          {" · updated "}{formatDate(f.updated_at)}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))
+                })()}
               </div>
             )}
           </div>

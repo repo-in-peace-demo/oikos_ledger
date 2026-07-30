@@ -1,6 +1,7 @@
 "use client"
 
 import type { MacroSemanticFact } from "@/lib/hooks/useMacro"
+import { confidenceCardClassName } from "@/lib/memoryCardStyle"
 
 interface Props {
   facts: MacroSemanticFact[]
@@ -36,7 +37,7 @@ export function MemoryPanel({ facts, lastDistilledAt }: Props) {
         <>
           <div className="space-y-2">
             {facts.map((f) => (
-              <div key={f.id} className="flex items-start gap-2 rounded-lg border bg-slate-50 px-3 py-2 text-xs">
+              <div key={f.id} className={confidenceCardClassName(f.confidence_status)}>
                 <span className="shrink-0" title={f.confidence_status}>
                   {f.confidence_status === "confirmed" ? "✅" : "🤔"}
                 </span>
