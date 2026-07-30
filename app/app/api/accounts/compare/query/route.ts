@@ -99,16 +99,27 @@ about confidence/trends over time.
 Decide which of exactly three tiers the question falls into, and respond with ONLY a JSON object \
 of the shape {"tier": "answer" | "redirect" | "reject", "response": "..."} — no other text.
 
+Keep "response" concise and conversational — this is spoken aloud, not read. Even when a \
+question asks you to cover multiple things (e.g. "what else does this page talk about", which \
+should still mention all three capabilities below), keep each one to a short phrase or sentence \
+rather than a paragraph — a complete, brief answer is always better than a longer one that risks \
+being cut off.
+
 1. "answer" — the question is about what this Compare page itself offers:
    - Spend deltas or shared/unique categories: answer using ONLY the numbers in the provided \
 table data — never invent a number that isn't there.
    - What the app remembers/recalls/has noticed, or confidence/trends over time: answer ONLY \
-from the provided comparison_snapshot memory facts, never from the raw table data. Always state \
-both the result and its confidence in one natural sentence: confidence_status "confirmed" \
-(usually a higher occurrence_count) should be stated with confidence; "tentative" (often \
-occurrence_count of 1 or 2) should be visibly hedged ("I've only seen this once or twice so far, \
-so take it with a grain of salt"). Example tone: "Axis has run higher than HDFC in Shopping for \
-24 straight checks, so I'm confident about that one. Utilities I've only seen once so far, so \
+from the provided comparison_snapshot memory facts, never from the raw table data. Confidence \
+phrasing is decided STRICTLY by each individual fact's own confidence_status field — "confirmed" \
+is always stated with confidence, "tentative" is always visibly hedged ("I've only seen this \
+once or twice so far, so take it with a grain of salt"). Never infer confidence from \
+occurrence_count itself, and never compare one fact's occurrence_count against another fact's in \
+the same response — a "confirmed" fact with occurrence_count 4 and a "confirmed" fact with \
+occurrence_count 27 are BOTH stated with equal confidence; the exact count is supplementary \
+detail, not something that downgrades the confidence framing on its own. Example tone, showing \
+two confirmed facts with very different counts stated equally confidently, alongside one genuinely \
+tentative fact: "Axis has run higher than HDFC in Shopping for 27 straight checks, and in \
+Utilities for 4 — I'm confident about both of those. Groceries I've only seen once so far, so \
 take that with a grain of salt." If there are no memory facts yet, say plainly that nothing is \
 confirmed yet rather than falling back to raw totals or inventing one.
    - What this page/feature can do ("what can this do", "what does this page talk about"): \
@@ -140,7 +151,13 @@ page, where that kind of question is already handled.
 3. "reject" — the question has nothing to do with bank statements or personal finance at all. \
 Decline plainly and briefly, matching this tone: "I'm only able to help with comparing your \
 accounts. Want to check a category or ask about one of your accounts?" Do not attempt to be \
-helpful beyond that, even if the user insists or frames it as hypothetical.`
+helpful beyond that, even if the user insists or frames it as hypothetical.
+   Exception: if the input is a brief personal/social remark rather than an actual off-topic \
+question — correcting how they were addressed (e.g. their name), a greeting, a simple \
+acknowledgment like "okay" or "thanks", or apologizing for talking over the assistant — still use \
+tier "reject" (there is nothing to look up), but respond with a brief, warm acknowledgment instead \
+of the fixed refusal above (apologize plainly if a name was wrong, otherwise just acknowledge it), \
+then invite them back to the page's content.`
 
 function buildUserContent(
   question: string,
@@ -209,12 +226,28 @@ export async function POST(request: Request) {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.3,
-      max_tokens: 300,
+      // Raised from 300 — a "describe all three capabilities" answer (see the "answer" tier's
+      // "what this page/feature can do" bullet) can routinely need more than 300 tokens, and a
+      // response cut off mid-sentence gets spoken back verbatim by the realtime voice model,
+      // producing an incomplete-sounding reply. The brevity instruction above keeps genuinely
+      // short answers short; this headroom is for the cases that legitimately cover more ground.
+      max_tokens: 500,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: buildUserContent(question, compareData, comparisonSnapshots) },
       ],
     })
+
+    if (completion.choices[0]?.finish_reason === "length") {
+      // Not fatal — still returns whatever text was generated — but worth surfacing, since a
+      // truncated mid-sentence answer is a real UX problem for a voice response, not a cosmetic one.
+      logError({
+        context: "compare.query.truncated",
+        error: new Error("Completion hit max_tokens before finishing — response may be cut off mid-sentence"),
+        userId: session.user.id,
+        question,
+      })
+    }
 
     const raw = completion.choices[0]?.message?.content ?? ""
     const result = parseTierResponse(raw)

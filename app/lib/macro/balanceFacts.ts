@@ -77,8 +77,27 @@ export async function loadMacroFacts(userId: string): Promise<MacroFactRow[]> {
 
   const cached = macroFactCache.get(userId)
   if (cached && cached.marker === marker) {
+    console.log(JSON.stringify({
+      level: "info",
+      timestamp: new Date().toISOString(),
+      context: "loadMacroFacts.cache",
+      event: "HIT",
+      userId,
+      marker,
+    }))
     return cached.data
   }
+
+  console.log(JSON.stringify({
+    level: "info",
+    timestamp: new Date().toISOString(),
+    context: "loadMacroFacts.cache",
+    event: "MISS",
+    reason: !cached ? "no_cached_entry" : "marker_mismatch",
+    userId,
+    marker,
+    cachedMarker: cached?.marker ?? null,
+  }))
 
   const factTypeList = MACRO_RELEVANT_FACT_TYPES.map((t) => `'${t}'`).join(", ")
   const data = await mcpSelectQuery<MacroFactRow>(`
