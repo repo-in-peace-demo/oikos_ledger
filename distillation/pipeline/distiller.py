@@ -451,6 +451,33 @@ def _extract_comparison_pairs(
     return pairs
 
 
+def _extract_comparison_pair_timestamps(
+    comparison_events: list[EpisodicEvent],
+) -> dict[tuple[str, str, str], list[datetime]]:
+    """Chronologically sorted created_at timestamps of every comparison_run event that actually
+    involved both accounts of a given pair — mirrors _extract_comparison_pairs' pair-key
+    derivation exactly (same account_ids-based grouping, same sorted-pair key), but collects
+    event timestamps instead of labels. Used to compute real elapsed time across the run's last
+    N checks (see describe_comparison_snapshot's elapsed parameter), the same actual-timestamp
+    approach already used for balance_snapshot (_extract_balance_snapshots/describe_balance_trend)
+    rather than counting distinct calendar-month labels.
+    """
+    timestamps: dict[tuple[str, str, str], list[datetime]] = {}
+    for event in comparison_events:
+        metadata = event.metadata_ or {}
+        account_ids = metadata.get("account_ids")
+        if not isinstance(account_ids, list) or len(account_ids) < 2:
+            continue
+        user_id = str(event.user_id)
+        for i in range(len(account_ids)):
+            for j in range(i + 1, len(account_ids)):
+                a, b = sorted([str(account_ids[i]), str(account_ids[j])])
+                timestamps.setdefault((user_id, a, b), []).append(event.created_at)
+    for key in timestamps:
+        timestamps[key].sort()
+    return timestamps
+
+
 def _get_confirmed_category_baselines(
     session: Session, user_id: str, account_id: str,
 ) -> dict[str, SemanticFact]:
@@ -475,6 +502,7 @@ def describe_comparison_snapshot(
     delta: float,
     prior_delta: float | None,
     prior_run_length: int,
+    pair_timestamps: list[datetime],
 ) -> tuple[str, int]:
     """delta = account_id's category mean minus compared_account_id's category mean, always
     computed in that fixed order regardless of who's currently higher — account_id/
@@ -487,6 +515,15 @@ def describe_comparison_snapshot(
     to 1 rather than continuing to count through a reversal. Mirrors describe_balance_trend's
     same-direction run-length logic, applied to "which account is higher" instead of "balance
     direction". Returns (description, occurrence_count).
+
+    pair_timestamps is every known comparison_run event timestamp for this pair, chronologically
+    sorted (see _extract_comparison_pair_timestamps) — elapsed real time is measured from the
+    first to the last of the run's last run_length checks (pair_timestamps[-run_length:], which
+    degrades gracefully to "all we have" if fewer events fall within the lookback window than
+    run_length) and phrased via _format_elapsed_duration — the same actual-timestamp approach
+    already used for balance_snapshot (describe_balance_trend), not a re-derived or
+    differently-behaving calculation, so this can't reintroduce the calendar-label-counting bug
+    fixed there.
     """
     if prior_delta is not None and prior_delta != 0 and (delta > 0) == (prior_delta > 0):
         run_length = prior_run_length + 1
@@ -497,9 +534,21 @@ def describe_comparison_snapshot(
         (account_label, compared_label) if delta >= 0 else (compared_label, account_label)
     )
     check_word = "check" if run_length == 1 else "checks"
+
+    window = pair_timestamps[-run_length:] if pair_timestamps else []
+    elapsed = (window[-1] - window[0]) if window else timedelta(0)
+    duration_phrase = _format_elapsed_duration(elapsed)
+    # "over the past {duration_phrase}" reads fine for "18 days" or "about 2 months", but
+    # "over the past less than a day" doesn't — _format_elapsed_duration's one phrase that isn't
+    # itself a "N unit(s)" quantity needs its own clause instead of blind concatenation.
+    elapsed_clause = (
+        "within the same day" if duration_phrase == "less than a day"
+        else f"over the past {duration_phrase}"
+    )
+
     description = (
         f"{higher_label} has run higher than {lower_label} in {category} spending "
-        f"for {run_length} consecutive {check_word}."
+        f"for {run_length} consecutive {check_word}, {elapsed_clause}."
     )
     return description, run_length
 
@@ -516,10 +565,12 @@ def run_comparison_snapshot_pass(
     """
     touched: set[FactKey] = set()
     pairs = _extract_comparison_pairs(comparison_events)
+    pair_timestamps = _extract_comparison_pair_timestamps(comparison_events)
 
     for (user_id, account_a, account_b), labels in pairs.items():
         label_a = labels.get(account_a, account_a)
         label_b = labels.get(account_b, account_b)
+        timestamps_for_pair = pair_timestamps.get((user_id, account_a, account_b), [])
 
         baselines_a = _get_confirmed_category_baselines(session, user_id, account_a)
         baselines_b = _get_confirmed_category_baselines(session, user_id, account_b)
@@ -542,6 +593,7 @@ def run_comparison_snapshot_pass(
 
             description, run_length = describe_comparison_snapshot(
                 label_a, label_b, category, delta, prior_delta, prior_run_length,
+                timestamps_for_pair,
             )
 
             upsert_or_supersede_fact(
