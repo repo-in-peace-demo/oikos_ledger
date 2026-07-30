@@ -109,11 +109,44 @@ export function useRealtimeVoiceSession(
   const streamRef = useRef<MediaStream | null>(null)
   const gainNodeRef = useRef<GainNode | null>(null)
   const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([])
+  // TEMPORARY — diagnostic-only, added to test the hypothesis that create_response: true lets the
+  // server auto-trigger a second, unrelated response before a first tool call's onToolCall
+  // resolves, which could have that second response's own output_item.added incorrectly consume
+  // a reservation meant for the still-pending first exchange. Do not build on this id for actual
+  // logic; remove this whole block (and the log call sites below) once the diagnostic pass is
+  // done and a real fix (if needed) is decided.
+  const currentResponseInstanceIdRef = useRef<string | null>(null)
+  function logDiagnostic(event: string, extra: Record<string, unknown>) {
+    console.log(JSON.stringify({
+      level: "info",
+      timestamp: new Date().toISOString(),
+      context: "useRealtimeVoiceSession.diagnostic",
+      event,
+      ...extra,
+    }))
+  }
   const isResponseInProgress = useRef(false)
   const processedCallIds = useRef<Set<string>>(new Set())
   const lastTranscriptRef = useRef<string>("")
-  const pendingUserTurnId = useRef<string | null>(null)
+  // FIFO queue, not a single "current" slot — back-to-back utterances (e.g. a short "all right"
+  // immediately followed by a real question) can have a second speech_started fire before the
+  // first utterance's transcription.completed arrives. A single ref got overwritten by the
+  // second placeholder before the first utterance's transcript landed, so the completed event
+  // (matched only by whatever pendingUserTurnId currently held, not by which utterance it was
+  // actually for) filled the *wrong* turn and left the second utterance's own turn never filled.
+  // Utterances are detected in strict chronological order (VAD boundaries) and their
+  // transcriptions complete in that same order, so a FIFO queue — push on speech_started, shift
+  // on the next completed event — pairs each transcript with its own utterance correctly
+  // regardless of how close together they were spoken.
+  const pendingUserTurnIds = useRef<string[]>([])
   const currentAssistantItemId = useRef<string | null>(null)
+  // Tracked alongside currentAssistantItemId — a function_call item has no audio content at all,
+  // so a barge-in landing while it's "current" (e.g. interrupting the assistant mid tool-call,
+  // before any spoken response exists yet) must not send conversation.item.truncate against it:
+  // the Realtime API rejects that with "Only model output audio messages can be truncated"
+  // (unsupported_content_type). response.cancel alone still applies — there's a response in
+  // progress to cancel, just nothing audio-bearing to truncate.
+  const currentAssistantItemType = useRef<string | null>(null)
   // Keyed by item_id, not a single "current" slot — a single response can contain more than one
   // assistant output item (e.g. a "commentary" item followed by a separate "final_answer" item,
   // each with its own item_id). A single shared ref would have the second item's deltas target
@@ -121,6 +154,22 @@ export function useRealtimeVoiceSession(
   // maps make that structurally impossible regardless of exact event timing.
   const assistantTurnIdByItemId = useRef<Map<string, string>>(new Map())
   const assistantTextByItemId = useRef<Map<string, string>>(new Map())
+  // FIFO queue, reserved synchronously at response.function_call_arguments.done — *before*
+  // awaiting the tool call — not only once response.output_item.added eventually fires. A tool
+  // call's own backend fetch (onToolCall) can take long enough that the user asks a follow-up
+  // question before it resolves; that follow-up's own turn gets appended immediately (at its
+  // speech_started), so if the first answer's turn isn't reserved until output_item.added — which
+  // only fires *after* the fetch resolves and a new response.create is sent — the follow-up's
+  // turn lands ahead of the still-pending first answer's, bunching both questions before either
+  // answer. Reserving here, synchronously, guarantees the first answer's position in the array is
+  // locked in before the second question can be asked, mirroring the same principle already
+  // applied to user turns at speech_started. Consumed once per response (see
+  // assistantReservationConsumedRef) by whichever item's output_item.added fires first for that
+  // response; a second item in the same response (e.g. commentary followed by final_answer) gets
+  // its own fresh turn instead, since by then its position is already correctly determined by
+  // having streamed after the first item, not by anything still waiting to be asked.
+  const pendingAssistantTurnIds = useRef<string[]>([])
+  const assistantReservationConsumedRef = useRef(false)
   const isGreetingInFlightRef = useRef(false)
   const mutedItemId = useRef<string | null>(null)
   const audioSamplesPlayed = useRef<number>(0)
@@ -340,11 +389,26 @@ export function useRealtimeVoiceSession(
 
         if (msg.type === "response.created") {
           isResponseInProgress.current = true
+          // Each new response gets one chance to claim a pending reservation, at whichever of its
+          // own items' output_item.added fires first (see pendingAssistantTurnIds above).
+          assistantReservationConsumedRef.current = false
+          const responseInstanceId = Math.random().toString(36).slice(2, 8)
+          currentResponseInstanceIdRef.current = responseInstanceId
+          logDiagnostic("response.created", {
+            responseInstanceId,
+            responseId: msg.response?.id ?? null,
+            pendingAssistantTurnIds: [...pendingAssistantTurnIds.current],
+            pendingUserTurnIds: [...(pendingUserTurnIds.current ?? [])],
+          })
           if (gainNodeRef.current) gainNodeRef.current.gain.value = 1
         }
 
         if (msg.type === "response.done") {
           isResponseInProgress.current = false
+          logDiagnostic("response.done", {
+            responseInstanceId: currentResponseInstanceIdRef.current,
+            responseId: msg.response?.id ?? null,
+          })
           // Cleared once per response, not per-item — a greeting response with more than one
           // output item (e.g. a commentary item followed by a final_answer item) would otherwise
           // have its second item incorrectly treated as no longer part of the greeting.
@@ -372,45 +436,75 @@ export function useRealtimeVoiceSession(
         // file header on stable turn-keying.
         if (msg.type === "input_audio_buffer.speech_started") {
           optionsRef.current.onSpeechStarted?.()
-          pendingUserTurnId.current = addTurn({ role: "user", content: "" })
-
-          // A still-streaming assistant item gets interrupted here — its partial content (what
-          // was actually spoken before the interruption) is left as-is rather than removed. No
-          // per-item tracking to reset: the next item gets its own fresh map entry at its own
-          // output_item.added, keyed by its own item_id (see assistantTurnIdByItemId above).
-
-          activeAudioSourcesRef.current.forEach((source) => {
-            try { source.stop() } catch { /* already finished naturally */ }
+          // Defensive: a hot-reload that changes this ref's shape can leave an already-mounted
+          // component with a stale value from before the edit (React preserves ref identity
+          // across Fast Refresh rather than re-running the initializer) — guard rather than trust
+          // the initial value alone.
+          if (!pendingUserTurnIds.current) pendingUserTurnIds.current = []
+          const newUserTurnId = addTurn({ role: "user", content: "" })
+          pendingUserTurnIds.current.push(newUserTurnId)
+          logDiagnostic("speech_started", {
+            userTurnId: newUserTurnId,
+            pendingUserTurnIds: [...pendingUserTurnIds.current],
+            pendingAssistantTurnIds: [...pendingAssistantTurnIds.current],
+            currentResponseInstanceId: currentResponseInstanceIdRef.current,
+            isResponseInProgress: isResponseInProgress.current,
           })
-          activeAudioSourcesRef.current = []
 
-          // Captured before the reset below (which zeroes the counter for the *next* item) — the
-          // truncate call needs how much of the *current*, being-interrupted item actually played.
-          // Previously this was read *after* the reset, so audio_end_ms was always sent as 0
-          // regardless of how much the user had actually heard, telling the model's own
-          // conversation history that its prior turn produced no audio at all.
-          const samplesPlayedBeforeInterrupt = audioSamplesPlayed.current
+          // Always interrupt on genuine barge-in, greeting included — deliberately reconsidered
+          // and reverted from an earlier version of this fix that skipped cancellation during the
+          // greeting specifically. That skip created a real risk: with create_response: true, the
+          // server auto-triggers a response as soon as it detects the end of the user's speech —
+          // if the greeting's own response were still active at that moment (since we'd stopped
+          // cancelling it), two responses could end up active in the same session simultaneously,
+          // a state this code elsewhere explicitly guards against ever allowing (e.g. the
+          // isResponseInProgress check before every other manual response.create below). A
+          // dropped or scrambled follow-up answer is a worse failure than the false-positive
+          // barge-in this was meant to prevent, and that root cause was never actually confirmed.
+          {
+            // A still-streaming assistant item gets interrupted here — its partial content (what
+            // was actually spoken before the interruption) is left as-is rather than removed. No
+            // per-item tracking to reset: the next item gets its own fresh map entry at its own
+            // output_item.added, keyed by its own item_id (see assistantTurnIdByItemId above).
 
-          if (audioContextRef.current) {
-            nextAudioStartTime = audioContextRef.current.currentTime
-            lastAudioScheduledEndTimeRef.current = audioContextRef.current.currentTime
-            audioSamplesPlayed.current = 0
-          }
-          if (gainNodeRef.current) gainNodeRef.current.gain.value = 0
-          mutedItemId.current = currentAssistantItemId.current
+            activeAudioSourcesRef.current.forEach((source) => {
+              try { source.stop() } catch { /* already finished naturally */ }
+            })
+            activeAudioSourcesRef.current = []
 
-          if (wsRef.current?.readyState === WebSocket.OPEN && isResponseInProgress.current) {
-            if (currentAssistantItemId.current) {
-              const playedMs = Math.round((samplesPlayedBeforeInterrupt / 24000) * 1000)
-              wsRef.current.send(JSON.stringify({
-                type: "conversation.item.truncate",
-                item_id: currentAssistantItemId.current,
-                content_index: 0,
-                audio_end_ms: playedMs,
-              }))
+            // Captured before the reset below (which zeroes the counter for the *next* item) — the
+            // truncate call needs how much of the *current*, being-interrupted item actually played.
+            // Previously this was read *after* the reset, so audio_end_ms was always sent as 0
+            // regardless of how much the user had actually heard, telling the model's own
+            // conversation history that its prior turn produced no audio at all.
+            const samplesPlayedBeforeInterrupt = audioSamplesPlayed.current
+
+            if (audioContextRef.current) {
+              nextAudioStartTime = audioContextRef.current.currentTime
+              lastAudioScheduledEndTimeRef.current = audioContextRef.current.currentTime
+              audioSamplesPlayed.current = 0
             }
-            wsRef.current.send(JSON.stringify({ type: "response.cancel" }))
-            isResponseInProgress.current = false
+            if (gainNodeRef.current) gainNodeRef.current.gain.value = 0
+            mutedItemId.current = currentAssistantItemId.current
+
+            if (wsRef.current?.readyState === WebSocket.OPEN && isResponseInProgress.current) {
+              // A function_call item has no audio content at all — truncating it is rejected by
+              // the Realtime API with "Only model output audio messages can be truncated"
+              // (unsupported_content_type). Only a message (audio-bearing) item is truncatable;
+              // response.cancel still applies either way, since there's a response in progress to
+              // cancel regardless of what its current item type is.
+              if (currentAssistantItemId.current && currentAssistantItemType.current === "message") {
+                const playedMs = Math.round((samplesPlayedBeforeInterrupt / 24000) * 1000)
+                wsRef.current.send(JSON.stringify({
+                  type: "conversation.item.truncate",
+                  item_id: currentAssistantItemId.current,
+                  content_index: 0,
+                  audio_end_ms: playedMs,
+                }))
+              }
+              wsRef.current.send(JSON.stringify({ type: "response.cancel" }))
+              isResponseInProgress.current = false
+            }
           }
         }
 
@@ -422,9 +516,9 @@ export function useRealtimeVoiceSession(
           if (msg.transcript?.trim()) {
             const transcript = msg.transcript.trim()
             lastTranscriptRef.current = transcript
-            if (pendingUserTurnId.current) {
-              updateTurn(pendingUserTurnId.current, { content: transcript })
-              pendingUserTurnId.current = null
+            const turnId = pendingUserTurnIds.current?.shift()
+            if (turnId) {
+              updateTurn(turnId, { content: transcript })
             }
             optionsRef.current.onUserTurn?.(transcript)
           }
@@ -439,6 +533,16 @@ export function useRealtimeVoiceSession(
           lastTranscriptRef.current = ""
 
           if (msg.name === "end_conversation") {
+            // Reserved for consistency with the tool-call path below, though this race is far
+            // less likely here — nothing is awaited before response.create is sent.
+            const endConversationTurnId = addTurn({ role: "assistant", content: "" })
+            pendingAssistantTurnIds.current.push(endConversationTurnId)
+            logDiagnostic("function_call_arguments.done.reserve", {
+              callId,
+              reservedTurnId: endConversationTurnId,
+              name: msg.name,
+              currentResponseInstanceId: currentResponseInstanceIdRef.current,
+            })
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(JSON.stringify({
                 type: "conversation.item.create",
@@ -458,6 +562,17 @@ export function useRealtimeVoiceSession(
             }, 300)
             return
           }
+
+          // Reserved synchronously, before awaiting the tool call below — see
+          // pendingAssistantTurnIds' declaration for why this can't wait until output_item.added.
+          const reservedTurnId = addTurn({ role: "assistant", content: "" })
+          pendingAssistantTurnIds.current.push(reservedTurnId)
+          logDiagnostic("function_call_arguments.done.reserve", {
+            callId,
+            reservedTurnId,
+            name: msg.name,
+            currentResponseInstanceId: currentResponseInstanceIdRef.current,
+          })
 
           try {
             const args = msg.arguments ? JSON.parse(msg.arguments as string) : {}
@@ -479,6 +594,11 @@ export function useRealtimeVoiceSession(
               }
             }
           } catch (err) {
+            // No response will ever come to consume this reservation — clean it up explicitly so
+            // a later question's turn doesn't inherit this one's stale, never-filled placeholder.
+            const idx = pendingAssistantTurnIds.current.indexOf(reservedTurnId)
+            if (idx !== -1) pendingAssistantTurnIds.current.splice(idx, 1)
+            removeTurn(reservedTurnId)
             console.error("useRealtimeVoiceSession: tool execution failed:", err)
             setError("Failed to process voice query.")
           }
@@ -487,6 +607,7 @@ export function useRealtimeVoiceSession(
         if (msg.type === "response.output_item.added" && msg.item?.role === "assistant") {
           const itemId = msg.item.id as string
           currentAssistantItemId.current = itemId
+          currentAssistantItemType.current = (msg.item.type as string | undefined) ?? null
           audioSamplesPlayed.current = 0
           mutedItemId.current = null
           assistantTextByItemId.current.set(itemId, "")
@@ -496,7 +617,34 @@ export function useRealtimeVoiceSession(
           // not per-item — a multi-item greeting response would otherwise have its second item
           // incorrectly treated as no longer part of the greeting).
           if (!isGreetingInFlightRef.current) {
-            assistantTurnIdByItemId.current.set(itemId, addTurn({ role: "assistant", content: "" }))
+            // The first item of a response claims this response's reservation (if any) — see
+            // pendingAssistantTurnIds' declaration. A second item in the same response (e.g.
+            // commentary followed by final_answer) falls through to a fresh turn instead, since
+            // there's nothing still waiting to be asked between two items of the same response.
+            let turnId: string | undefined
+            let consumedReservation = false
+            if (!assistantReservationConsumedRef.current) {
+              assistantReservationConsumedRef.current = true
+              turnId = pendingAssistantTurnIds.current?.shift()
+              consumedReservation = turnId !== undefined
+            }
+            const finalTurnId = turnId ?? addTurn({ role: "assistant", content: "" })
+            assistantTurnIdByItemId.current.set(itemId, finalTurnId)
+            logDiagnostic("output_item.added", {
+              itemId,
+              currentResponseInstanceId: currentResponseInstanceIdRef.current,
+              consumedReservation,
+              turnId: finalTurnId,
+              freshlyCreated: !consumedReservation,
+              pendingAssistantTurnIdsAfter: [...pendingAssistantTurnIds.current],
+            })
+          } else {
+            logDiagnostic("output_item.added", {
+              itemId,
+              currentResponseInstanceId: currentResponseInstanceIdRef.current,
+              suppressedAsGreeting: true,
+              pendingAssistantTurnIdsAfter: [...pendingAssistantTurnIds.current],
+            })
           }
         }
 
@@ -535,6 +683,7 @@ export function useRealtimeVoiceSession(
           // one-sentence greeting) make that gap proportionally more likely to be hit.
           if (currentAssistantItemId.current === itemId) {
             currentAssistantItemId.current = null
+            currentAssistantItemType.current = null
           }
 
           if (hasFunctionCall && !textContent) {

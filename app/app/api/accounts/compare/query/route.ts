@@ -146,7 +146,13 @@ page, where that kind of question is already handled.
 3. "reject" — the question has nothing to do with bank statements or personal finance at all. \
 Decline plainly and briefly, matching this tone: "I'm only able to help with comparing your \
 accounts. Want to check a category or ask about one of your accounts?" Do not attempt to be \
-helpful beyond that, even if the user insists or frames it as hypothetical.`
+helpful beyond that, even if the user insists or frames it as hypothetical.
+   Exception: if the input is a brief personal/social remark rather than an actual off-topic \
+question — correcting how they were addressed (e.g. their name), a greeting, a simple \
+acknowledgment like "okay" or "thanks", or apologizing for talking over the assistant — still use \
+tier "reject" (there is nothing to look up), but respond with a brief, warm acknowledgment instead \
+of the fixed refusal above (apologize plainly if a name was wrong, otherwise just acknowledge it), \
+then invite them back to the page's content.`
 
 function buildUserContent(
   question: string,
