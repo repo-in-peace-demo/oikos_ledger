@@ -4,6 +4,7 @@ import { useState } from "react"
 import type { BankAccount } from "@/types"
 import { confidenceCardClassName } from "@/lib/memoryCardStyle"
 import { highlightText } from "@/lib/highlightText"
+import { CollapsibleSection } from "@/components/ui/CollapsibleSection"
 import { CompareVoiceButton } from "./CompareVoiceButton"
 
 interface CategoryDelta {
@@ -188,7 +189,43 @@ export function ComparePanel({ accounts, firstName }: ComparePanelProps) {
 
       {data && (
         <>
-          <CompareVoiceButton compareData={data} firstName={firstName} />
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <CompareVoiceButton compareData={data} firstName={firstName} />
+            </div>
+
+            {/* Collapsed by default — mechanism depth for anyone who wants it, without adding
+                permanent clutter to an already-dense page. Sits alongside the voice button rather
+                than stacking below it, saving vertical space. Text below is copied verbatim from
+                the voice assistant's own system prompt (app/api/accounts/compare/query/route.ts's
+                SYSTEM_PROMPT "How the comparison/memory mechanism itself works" bullet) — kept in
+                sync by hand, not paraphrased, so this section can never say something different
+                from what the voice assistant says aloud. MIN_OCCURRENCES_FOR_TREND in that
+                route.ts is 3; update the "3" below too if that value ever changes. */}
+            <CollapsibleSection label="How this works" className="w-72 shrink-0">
+              <p>
+                Every time these two accounts are compared, that single check is logged as an
+                immutable &quot;episodic event&quot; — a permanent record of what was observed
+                that one time.
+              </p>
+              <p>
+                A &quot;semantic fact&quot; (what&apos;s shown as a memory fact above) is the
+                conclusion drawn once enough episodic events agree with each other — e.g. which
+                account has run higher in a category, and for how many checks in a row.
+              </p>
+              <p>
+                &quot;Distillation&quot; is the scheduled background process that periodically
+                reads the log of episodic events and either promotes a pattern to a semantic
+                fact, updates an existing one, or lets a fact that hasn&apos;t been reinforced
+                recently decay in relevance over time.
+              </p>
+              <p>
+                The confirmation threshold is a fixed number, not an estimate: a pattern needs to
+                be observed 3 separate times before it&apos;s promoted from &quot;tentative&quot;
+                to &quot;confirmed&quot;.
+              </p>
+            </CollapsibleSection>
+          </div>
 
           <div className="rounded-xl border bg-card p-5 space-y-3">
             <div>
