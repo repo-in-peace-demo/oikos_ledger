@@ -151,21 +151,30 @@ Line chart uses `connectNulls={true}` to bridge sparse date sequences. Single-po
 
 ## Voice Interface
 
-`components/insights/InsightsPanel.tsx` (voice section)
+`app/lib/voice/useRealtimeVoiceSession.ts` (shared hook) + `app/components/voice/VoiceButton.tsx` (shared button/status-bar/transcript UI)
+
+Four pages use voice — Insights, Compare, Macro, Recommendations. Each independently copied the WebSocket/audio/turn-ordering mechanics at first, accumulating inconsistent fixes; all four now share one hook. Compare and Macro also share the presentational `VoiceButton`. Insights keeps its own chat UI (SQL/chart-bearing data cards) and wires the hook's callbacks into its existing turn state instead. Recommendations keeps its own header-integrated button (visually predates the shared one) but runs on the same hook.
 
 ### Connection Flow
 
-1. `connectVoice()` — warmup mic → fetch ephemeral key → open WebSocket → send `session.update`
-2. Greeting sent after mic connected via `response.create`
-3. VAD detects speech → `input_audio_buffer.speech_started` → cancel timer, mute gain, send `response.cancel` + `conversation.item.truncate`
-4. Transcription completed → store in `lastTranscriptRef`, start 500ms timer
-5. Tool call fires → cancel timer, add user turn, call `handleQuery(question, undefined, true, true)`
-6. Timer fires (no tool call) → conversational turn added
-7. Tool result sent back → `response.create` if not in progress
-8. `end_conversation` tool → 300ms delay → set `awaitingFarewellResponse` → `response.create`
-9. `response.done` with `awaitingFarewellResponse` → promote to `shouldDisconnectAfterResponse` → disconnect after audio drains
+1. `connectVoice()` — warm up mic → fetch ephemeral key (`POST /api/insights/session`, generic across all four pages) → open WebSocket → send `session.update` (page-specific instructions/tools/VAD)
+2. Greeting sent after mic connected via `response.create` with page-specific greeting instructions (skipped if a page doesn't configure one); tracked via `isGreetingInFlightRef` so it never becomes a visible turn
+3. VAD detects speech → `input_audio_buffer.speech_started` → reserve a user-turn placeholder (see Turn Ordering below), mute gain, send `response.cancel` + `conversation.item.truncate` (only if the interrupted item is a `message`, not a `function_call`)
+4. Transcription completed → fill the reserved placeholder, call the page's `onUserTurn` callback if provided
+5. Tool call fires (`response.function_call_arguments.done`) → reserve an assistant-turn placeholder *before* awaiting the tool's backend fetch → call the page's tool handler → send `function_call_output` → `response.create` if not already in progress
+6. Assistant text streams in live via `response.output_audio_transcript.delta`, keyed per `item_id`
+7. `end_conversation` tool → 300ms delay → set `awaitingFarewellResponse` → `response.create`
+8. `response.done` with `awaitingFarewellResponse` → promote to `shouldDisconnectAfterResponse` → disconnect after audio drains
 
-### Voice vs Text Mode Differences
+### Turn Ordering
+
+Both directions are keyed *before* the corresponding content exists:
+
+- **User turns**: reserved at `speech_started`, filled at transcription-complete. FIFO queue (`pendingUserTurnIds`) — a second utterance's `speech_started` can fire before the first utterance's transcription lands, so a single ref would misattribute the fill.
+- **Assistant turns**: reserved synchronously at `function_call_arguments.done`, before the `await` on the tool's own backend call — that call can take long enough for the user to ask a follow-up question in the meantime. Also a FIFO queue (`pendingAssistantTurnIds`); cleaned up explicitly if the tool call throws.
+- **Assistant text**: keyed per `item_id` (`Map`, not a single "current" slot) — one response can contain more than one assistant item (e.g. a "commentary" item followed by a separate "final_answer" item), and a shared slot would have the second item's deltas overwrite the first's already-populated turn.
+
+### Voice vs Text Mode Differences (Insights only — the other three pages are voice-first with no separate text mode)
 
 | Behaviour | Text mode | Voice mode |
 |---|---|---|
@@ -174,14 +183,13 @@ Line chart uses `connectNulls={true}` to bridge sparse date sequences. Single-po
 | Suggestions | Shown | Suppressed |
 | Off-topic canned message | Shown | Suppressed (model handles via audio) |
 | Audio playback | Optional via speaker button | Always on (via Realtime API) |
-| Speaker button | Visible | Hidden |
-| Input cleared after query | On submit | After transcript timer / tool call |
 
 ### Barge-in
 
 - Server-side VAD with `interrupt_response: true` handles auto-cancellation
 - Client-side: on `speech_started`, GainNode gain set to 0 (mutes buffered audio), `mutedItemId` set to skip in-flight deltas
-- `conversation.item.truncate` sent with `audio_end_ms` = samples played × (1000/24000)
+- `conversation.item.truncate` sent with `audio_end_ms` = samples played × (1000/24000) — captured *before* the sample counter resets for the next item, and only for a `message`-type current item (a `function_call` item has no audio; truncating one is rejected with `unsupported_content_type`)
+- `currentAssistantItemId` cleared as soon as its item completes — left uncleared, a barge-in landing in the gap before `response.done` fires could target an already-finalized item ("item_id not found")
 - `response.created` restores gain to 1 for the new response
 - `response_cancel_not_active` errors suppressed silently
 
@@ -193,8 +201,12 @@ OpenAI → audio delta (PCM 24kHz) → AudioBufferSourceNode → GainNode → de
 ```
 
 - `audioSamplesPlayed` ref tracks playback position for truncation
-- `currentAssistantItemId` ref tracks active item
+- `currentAssistantItemId` / `currentAssistantItemType` refs track the active item and whether it's truncatable
 - `lastAudioScheduledEndTimeRef` used for disconnect timing
+
+### Transcript Window
+
+Optional per page (`showTranscript` on `VoiceButton`) — Recommendations opts out (no transcript shown) while the hook still tracks turns internally; Compare and Macro opt in via the shared `VoiceButton`; Insights renders its own richer turn list instead. Where shown, the window is visible as soon as the session connects (not gated on any turn existing yet, so it's already open when the greeting plays) and auto-scrolls only when the user was already near the bottom, using `Element.scrollTo` on the transcript container itself rather than `scrollIntoView` (which can leak scroll to ancestor containers).
 
 ---
 
@@ -211,8 +223,7 @@ OpenAI → audio delta (PCM 24kHz) → AudioBufferSourceNode → GainNode → de
 | Analytics active tab | `localStorage` under `oikos_analytics_active_tab` |
 | Insights turns | `sessionStorage` per account, restored on mount and account switch |
 | Date filter | `sessionStorage` per account |
-| Voice refs | `useRef` (never causes re-renders) for WebSocket, AudioContext, timers, flags |
-| Audio enabled | `useState` + `useRef` (ref used inside WebSocket closure to avoid stale closure) |
+| Voice refs | `useRef` (never causes re-renders) for WebSocket, AudioContext, timers, flags — shared across all 4 voice-enabled pages via `useRealtimeVoiceSession` |
 
 ---
 

@@ -130,32 +130,39 @@ POST /api/insights/query
 
 ### Voice Interface — OpenAI Realtime API
 
-**Model:** `gpt-realtime-2` via WebSocket (`wss://api.openai.com/v1/realtime`)  
-**Session:** Ephemeral key from `POST /api/insights/session`
+**Model:** `gpt-realtime-2` via WebSocket (`wss://api.openai.com/v1/realtime`)
+**Session:** Ephemeral key from `POST /api/insights/session` (a generic, page-agnostic endpoint — reused as-is by every consumer below)
 
-**Tools in session:**
-- `query_database` — triggers `handleQuery` → `POST /api/insights/query` with `is_voice: true`
-- `end_conversation` — farewell flow → timed disconnect
+Originally built once, directly inside `InsightsPanel.tsx`. As Compare, Macro, and Recommendations each grew their own voice feature, the WebSocket/audio/turn-ordering mechanics were copied independently three more times, accumulating inconsistent fixes. All four now share one implementation:
+
+- **`app/lib/voice/useRealtimeVoiceSession.ts`** — the hook. Owns the WebSocket connection, mic capture/audio playback, barge-in, turn-ordering, and the farewell/disconnect lifecycle for all four pages.
+- **`app/components/voice/VoiceButton.tsx`** — shared presentational mic button + status bar + optional transcript window, driven entirely by the hook's return value. Used directly by Compare and Macro. Insights keeps its own richer chat UI (SQL/chart-bearing data cards, not plain text bubbles) and instead wires the hook's callbacks (`onUserTurn`, `onAssistantTurn`, `onUserTranscriptDelta`, `onSpeechStarted`) into its existing `ChatTurn` state. Recommendations also renders its own header-integrated button (predates the shared UI, kept as-is to avoid a visual regression) but runs on the same hook underneath.
+
+**What's page-specific** (passed as options into the hook, not shared): the system prompt / in-scope-redirect-reject content, which tools are available (`ask_compare`, `ask_macro`, `query_database`, or none at all for Recommendations — its whole dataset is baked into `instructions` once at connect time), whether a transcript window renders, and VAD tuning.
+
+**VAD config** (per page — Recommendations is deliberately gentler):
+```typescript
+// Insights / Compare / Macro
+turn_detection: { type: "server_vad", threshold: 0.8, prefix_padding_ms: 500, silence_duration_ms: 1000, interrupt_response: true, create_response: true }
+
+// Recommendations
+turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 800, interrupt_response: true, create_response: true }
+```
 
 **Audio pipeline:**
 - Mic → AudioWorklet (PCM resampled to 16kHz) → WebSocket
 - WebSocket audio deltas → AudioContext scheduler (24kHz output)
-- GainNode mute on barge-in; `conversation.item.truncate` to sync server state
-- `currentAssistantItemId` ref tracks active item; `mutedItemId` ref skips in-flight chunks after truncation
+- GainNode mute on barge-in; `conversation.item.truncate` to sync server state — sent only when the current item's type is `"message"` (audio-bearing); a `function_call` item has no audio, and truncating one is rejected by the Realtime API with `unsupported_content_type`
+- `currentAssistantItemId` ref tracks the active item, cleared as soon as that item completes — left uncleared, a barge-in landing in the gap before the response's own `response.done` fires could target an already-finalized item ("item_id not found")
+- `mutedItemId` ref skips in-flight chunks after truncation
 
-**VAD config:**
-```typescript
-turn_detection: {
-  type: "server_vad",
-  threshold: 0.5,
-  prefix_padding_ms: 300,
-  silence_duration_ms: 800,
-  interrupt_response: true,
-  create_response: true,
-}
-```
+**Turn-ordering** (both directions are keyed *before* the corresponding content exists, not after):
+- **User turns** — reserved as an empty placeholder at `input_audio_buffer.speech_started`, filled in once transcription completes. A FIFO queue (`pendingUserTurnIds`), not a single ref — back-to-back utterances can have a second `speech_started` fire before the first utterance's transcription lands.
+- **Assistant turns** — reserved synchronously inside `response.function_call_arguments.done`, *before* awaiting the tool call's own backend fetch (which can take long enough for the user to ask a follow-up question in the meantime). Also a FIFO queue (`pendingAssistantTurnIds`), consumed by whichever item's `output_item.added` fires first for that response; explicitly cleaned up if the tool call throws, so a failed exchange can't leave a stale reservation for the next question to inherit.
+- **Assistant text streaming** — populated live via `response.output_audio_transcript.delta` (not only once `output_item.done` delivers the whole thing at once), keyed by `item_id` rather than a single "current" slot — a response can contain more than one assistant item (e.g. a "commentary" item followed by a separate "final_answer" item), and a shared slot would have the second item's deltas overwrite the first item's already-populated turn.
+- The connect-time greeting is tracked explicitly (`isGreetingInFlightRef`) and never becomes a turn, regardless of phase.
 
-**Voice vs text differences:**
+**Voice vs text differences** (Insights-specific; Compare/Macro/Recommendations are voice-only or text-free by design):
 - `is_voice: true` → data cards (SQL + chart) shown in UI; text bubble suppressed
 - Suggestions and off-topic canned messages suppressed in voice
 - Model speaks summary via audio; UI shows chart/table card only
