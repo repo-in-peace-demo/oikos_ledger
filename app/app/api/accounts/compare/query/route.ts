@@ -109,10 +109,16 @@ being cut off.
    - Spend deltas or shared/unique categories: answer using ONLY the numbers in the provided \
 table data — never invent a number that isn't there.
    - What the app remembers/recalls/has noticed, or confidence/trends over time: answer ONLY \
-from the provided comparison_snapshot memory facts, never from the raw table data. Confidence \
-phrasing is decided STRICTLY by each individual fact's own confidence_status field — "confirmed" \
-is always stated with confidence, "tentative" is always visibly hedged ("I've only seen this \
-once or twice so far, so take it with a grain of salt"). Never infer confidence from \
+from the provided comparison_snapshot memory facts, never from the raw table data. If the \
+question covers more than one category (e.g. "what have you noticed", "summarize everything"), \
+use the pre-grouped "by which account is higher" structure and its category lists VERBATIM — do \
+NOT read multiple facts' description text yourself and work out who's higher in which category; \
+that grouping is computed for you precisely because reading several descriptions and mentally \
+combining them is exactly where mistakes happen. If the question is about ONE specific category, \
+you may read that single fact's own description/occurrence_count/confidence_status directly. \
+Confidence phrasing is decided STRICTLY by each individual fact's own confidence_status field — \
+"confirmed" is always stated with confidence, "tentative" is always visibly hedged ("I've only \
+seen this once or twice so far, so take it with a grain of salt"). Never infer confidence from \
 occurrence_count itself, and never compare one fact's occurrence_count against another fact's in \
 the same response — a "confirmed" fact with occurrence_count 4 and a "confirmed" fact with \
 occurrence_count 27 are BOTH stated with equal confidence; the exact count is supplementary \
@@ -159,16 +165,53 @@ tier "reject" (there is nothing to look up), but respond with a brief, warm ackn
 of the fixed refusal above (apologize plainly if a name was wrong, otherwise just acknowledge it), \
 then invite them back to the page's content.`
 
+// Groups facts by which account is higher, computed from each fact's own account_id/
+// compared_account_id/running_mean fields — never by reading and comparing multiple facts'
+// free-text descriptions, which is what let a multi-category summary answer misattribute one
+// category to the wrong account (confirmed live: "Axis has run higher... Utilities..." when the
+// Utilities fact's own data said HDFC). running_mean is account_id's mean minus
+// compared_account_id's — mirrors describe_comparison_snapshot's own higher/lower derivation
+// exactly (distiller.py): account_id is higher when running_mean >= 0, compared_account_id
+// otherwise.
+function groupByHigherAccount(
+  comparisonSnapshots: ComparisonSnapshot[],
+  accounts: { account_id: string; label: string }[],
+): { account_label: string; categories: { category: string; occurrence_count: number; confidence_status: string }[] }[] {
+  const labelFor = (id: string) => accounts.find((a) => a.account_id === id)?.label ?? id
+  const groups = new Map<string, { category: string; occurrence_count: number; confidence_status: string }[]>()
+
+  for (const fact of comparisonSnapshots) {
+    const higherAccountId = Number(fact.running_mean) >= 0 ? fact.account_id : fact.compared_account_id
+    const label = labelFor(higherAccountId)
+    const list = groups.get(label) ?? []
+    list.push({
+      category: fact.category,
+      occurrence_count: fact.occurrence_count,
+      confidence_status: fact.confidence_status,
+    })
+    groups.set(label, list)
+  }
+
+  return Array.from(groups.entries()).map(([account_label, categories]) => ({ account_label, categories }))
+}
+
 function buildUserContent(
   question: string,
   compareData: CompareData,
   comparisonSnapshots: ComparisonSnapshot[],
 ): string {
   const { comparison_snapshots: _ignored, ...tableData } = compareData
+  const groupedByHigherAccount = groupByHigherAccount(comparisonSnapshots, compareData.accounts)
   return `Question: ${question}\n\n`
     + `Current Compare table data:\n${JSON.stringify(tableData, null, 2)}\n\n`
     + `Comparison memory facts (freshly queried, confidence-scored):\n`
-    + `${JSON.stringify(comparisonSnapshots, null, 2)}`
+    + `${JSON.stringify(comparisonSnapshots, null, 2)}\n\n`
+    + `Pre-grouped by which account is higher (computed deterministically, not by you) — when \
+answering a question covering more than one category, use this grouping and these category \
+lists VERBATIM. Never re-derive who is higher in which category yourself by reading multiple \
+facts' description text — read each fact's description only for a single specific category \
+asked about directly:\n`
+    + `${JSON.stringify(groupedByHigherAccount, null, 2)}`
 }
 
 function parseTierResponse(text: string): { tier: Tier; response: string } | null {
@@ -221,6 +264,26 @@ export async function POST(request: Request) {
       userId: session.user.id,
     })
   }
+
+  // What was actually retrieved, before grouping/formatting for the model — lets a future
+  // investigation directly compare "what the database returned" against "what got said" without
+  // needing to manually query and cross-reference by hand (see the multi-category-summary
+  // miscategorization bug this was added for).
+  console.log(JSON.stringify({
+    level: "info",
+    timestamp: new Date().toISOString(),
+    context: "compare.query.comparisonSnapshots",
+    userId: session.user.id,
+    question,
+    facts: comparisonSnapshots.map((f) => ({
+      category: f.category,
+      account_id: f.account_id,
+      compared_account_id: f.compared_account_id,
+      running_mean: f.running_mean,
+      occurrence_count: f.occurrence_count,
+      confidence_status: f.confidence_status,
+    })),
+  }))
 
   try {
     const completion = await openai.chat.completions.create({

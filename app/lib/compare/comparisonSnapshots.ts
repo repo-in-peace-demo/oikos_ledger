@@ -33,6 +33,19 @@ export type ComparisonSnapshotRow = {
   occurrence_count: number
   confidence_status: string
   updated_at: string
+  // account_id/compared_account_id/running_mean added so a multi-category summary can be grouped
+  // by which account is higher deterministically in code — rather than the model having to read
+  // and mentally aggregate every fact's free-text description (each stating the higher account's
+  // name first, e.g. "Axis Bank has run higher than HDFC Bank in Utilities...") across several
+  // facts in one synthesized sentence, which is exactly the kind of aggregation task an LLM can
+  // get wrong (confirmed live: a multi-category summary misattributed one category to the wrong
+  // account, contradicting a direct single-category lookup). running_mean = account_id's category
+  // mean minus compared_account_id's — mirrors describe_comparison_snapshot's own
+  // higher_label/lower_label derivation exactly (distiller.py): account_id is higher when
+  // running_mean >= 0, compared_account_id otherwise.
+  account_id: string
+  compared_account_id: string
+  running_mean: number | null
 }
 
 type ComparisonSnapshotCacheEntry = { marker: string | null; data: ComparisonSnapshotRow[] }
@@ -116,7 +129,8 @@ export async function loadComparisonSnapshots(
 
   const idList = accountIds.map((id) => `'${id}'`).join(",")
   const data = await mcpSelectQuery<ComparisonSnapshotRow>(`
-    SELECT id, category, description, occurrence_count, confidence_status, updated_at
+    SELECT id, category, description, occurrence_count, confidence_status, updated_at,
+      account_id, compared_account_id, running_mean
     FROM semantic_facts
     WHERE user_id = '${userId}'
       AND fact_type = '${COMPARISON_SNAPSHOT_FACT_TYPE}'
