@@ -132,19 +132,22 @@ export function MacroPanel({ firstName }: Props) {
           </div>
         ) : (
           <>
-            <MacroVoiceButton macroData={macroVoiceData} firstName={firstName} />
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <MacroVoiceButton macroData={macroVoiceData} firstName={firstName} />
+              </div>
 
-            {/* Collapsed by default — mechanism depth for anyone who wants it, without adding
-                permanent clutter to an already-dense page. Placed near the top rather than the
-                bottom so it's visible without a full scroll. Text below is copied verbatim from
-                the voice assistant's own system prompt (app/api/macro/query/route.ts's
-                SYSTEM_PROMPT "How the comparison/memory mechanism itself works" bullet) and the
-                chart's own caption (BalanceTrendChart.tsx) — kept in sync by hand, not
-                paraphrased, so this section can never say something different from what the
-                voice assistant says aloud. MIN_OCCURRENCES_FOR_TREND in that route.ts is 3;
-                update the "3" below too if that value ever changes. */}
-            <section>
-              <CollapsibleSection label="How this works">
+              {/* Collapsed by default — mechanism depth for anyone who wants it, without adding
+                  permanent clutter to an already-dense page. Sits alongside the voice button
+                  rather than stacking below it, saving vertical space. Text below is copied
+                  verbatim from the voice assistant's own system prompt
+                  (app/api/macro/query/route.ts's SYSTEM_PROMPT "How the comparison/memory
+                  mechanism itself works" bullet) and the chart's own caption
+                  (BalanceTrendChart.tsx) — kept in sync by hand, not paraphrased, so this section
+                  can never say something different from what the voice assistant says aloud.
+                  MIN_OCCURRENCES_FOR_TREND in that route.ts is 3; update the "3" below too if
+                  that value ever changes. */}
+              <CollapsibleSection label="How this works" className="w-72 shrink-0">
                 <p>
                   Every real visit to this page is logged as an immutable &quot;episodic
                   event&quot; — a permanent record of the combined balance observed that one time.
@@ -178,7 +181,7 @@ export function MacroPanel({ firstName }: Props) {
                   &quot;real&quot; figure.
                 </p>
               </CollapsibleSection>
-            </section>
+            </div>
 
             {/* Context — the economic backdrop, national data, not specific to you */}
             <section className="space-y-4">
