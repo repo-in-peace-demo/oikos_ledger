@@ -834,7 +834,37 @@ Behaviour:
   - Use run_sql when the user asks about their financial data
   - If the question is a follow-up, use conversation history
     to carry forward all relevant filters (merchant, category,
-    date range) unless the user explicitly changes them
+    date range) unless the user explicitly changes them —
+    this INCLUDES which column the prior turn queried, not
+    just filters. If the previous turn was about "balance" and
+    queried closing_balance, a follow-up that only adds or
+    changes a date range (e.g. "last month", "and the month
+    before that") is STILL about balance — the new query must
+    also select closing_balance, never fall back to summing
+    debits/credits just because the follow-up itself doesn't
+    repeat the word "balance".
+    Example: prior turn "has my balance been changing lately?"
+    used closing_balance. User now says "last month" alone →
+    SELECT TO_CHAR(transaction_date, 'YYYY-MM-DD') AS day, closing_balance
+    FROM transactions
+    WHERE user_id = '${userId}' AND account_id = '${accountId}'
+      AND transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+      AND transaction_date < DATE_TRUNC('month', CURRENT_DATE)
+      AND closing_balance IS NOT NULL
+    ORDER BY transaction_date ASC
+    — NOT a debit/credit/net query.
+  - NEVER use the word "balance" to describe a debit/credit/net
+    total. Net cash flow (credits minus debits) for a period is
+    NOT the same thing as an account balance, which only ever
+    comes from the closing_balance column. If the results don't
+    include closing_balance, do not use the word "balance"
+    anywhere in the response — describe it as spending, income,
+    or net cash flow instead.
+  - NEVER describe a chart, a data trend, or a specific number
+    without first calling run_sql for THIS question. Even if a
+    similar-sounding chart or figure was mentioned earlier in
+    the conversation, you do not have its exact values in memory
+    — re-query rather than describe from memory or assumption.
   - If the question is ambiguous and context doesn't resolve
     it, respond directly with a short clarifying question
     (do NOT call run_sql)
@@ -843,6 +873,39 @@ Behaviour:
   - Keep all direct responses to 1-2 sentences
   - Always use ${currency} for currency amounts
   - Lead with the answer, never repeat the question back`
+}
+
+// Deterministic, code-level safety net — not a substitute for the prompt-level fixes above and
+// the routing exclusion that keeps balance questions off the pre-built intent path entirely, but
+// those are still model behavior, which was exactly what failed live before this was added. A
+// response describing "balance" must be backed by an actual closing_balance value from the
+// executed query — never inferred, described, or narrated from debit/credit/net totals. If the
+// SQL never selected closing_balance but the model's own summary uses balance language anyway,
+// the summary is replaced with an explicitly-labeled net-cash-flow framing instead of being sent
+// as-is, and the mismatch is logged so a future occurrence is immediately diagnosable rather than
+// silently corrected with no trace.
+const BALANCE_WORD_REGEX = /\bbalances?\b/i
+const CLOSING_BALANCE_COLUMN_REGEX = /closing_balance/i
+
+function enforceBalanceLanguageGuard(
+  summaryText: string,
+  sqlText: string,
+  context: { userId: string; accountId: string; question: string; source: string },
+): string {
+  if (!BALANCE_WORD_REGEX.test(summaryText) || CLOSING_BALANCE_COLUMN_REGEX.test(sqlText)) {
+    return summaryText
+  }
+  logError({
+    context: "balanceLanguageGuard.violation",
+    error: new Error(
+      "Response used 'balance' language but the executed SQL never selected closing_balance — "
+      + "likely narrating a debit/credit/net total as if it were an account balance",
+    ),
+    ...context,
+    sql: sqlText,
+    summaryText,
+  })
+  return "This reflects your net cash flow (credits minus debits) for the period, not your actual account balance — ask specifically about your balance to see the real closing_balance figure."
 }
 
 type AgentResult =
@@ -1016,7 +1079,8 @@ async function runAgentLoop(
       role: "user",
       content: `Summarize the results in 1-2 sentences.
 The data is being rendered as a "${inferredChartType}" in the UI.
-${totalDebits > 0 || totalCredits > 0 ? `Pre-computed totals — debits: ${totalDebits.toFixed(2)}, credits: ${totalCredits.toFixed(2)}` : ""}
+${totalDebits > 0 || totalCredits > 0 ? `Pre-computed totals (net cash flow, NOT a balance) — debits: ${totalDebits.toFixed(2)}, credits: ${totalCredits.toFixed(2)}` : ""}
+${!parsedSQL.toLowerCase().includes("closing_balance") ? `This query did NOT select closing_balance — never use the word "balance" anywhere in this response, describe it as spending, income, or net cash flow instead.` : ""}
 Lead with the answer. Use ${currency} for amounts.`,
     },
   ]
@@ -1034,11 +1098,15 @@ Lead with the answer. Use ${currency} for amounts.`,
     summary += chunk.choices[0]?.delta?.content ?? ""
   }
 
+  const guardedSummary = enforceBalanceLanguageGuard(summary.trim(), parsedSQL, {
+    userId, accountId, question, source: "runAgentLoop",
+  })
+
   return {
     type: "sql_result",
     sql: parsedSQL,
     rows,
-    summary: summary.trim(),
+    summary: guardedSummary,
     chartType: inferredChartType,
   }
 }
@@ -1190,6 +1258,24 @@ export async function POST(request: Request) {
     // excluding any credits or refunds" would otherwise match the credits_vs_debits keyword check
     // (plain substring matching has no concept of negation) and lose its category filter entirely.
     if (categoryNames.some((name) => q.includes(name))) return null
+    // Balance questions must NEVER be routed to a pre-built intent: none of INTENTS' SQL selects
+    // closing_balance (they're all debit/credit/net aggregations over `transactions`), and none
+    // of them do any natural-language date parsing — they only ever respect the UI's explicit
+    // date_from/date_to params, never a phrase like "last month" in the question text itself.
+    // Only the custom agent loop (AGENT_SYSTEM_PROMPT) has both the closing_balance-awareness and
+    // the NL date-parsing a balance follow-up needs. Confirmed live: a bare follow-up ("Last
+    // month") gets reformulated by the realtime voice model — which is explicitly instructed to
+    // fold in prior context before calling query_database — into phrasing that can independently
+    // satisfy the monthly_trend keyword check below (e.g. containing both "month" and "trend"),
+    // silently losing the balance framing AND the date filter in one misroute. Checked against
+    // conversation history too, not just the current question — a bare follow-up may not repeat
+    // the word "balance" at all, even after reformulation.
+    const recentHistoryText = (conversation_history ?? [])
+      .slice(-4)
+      .map((h: HistoryEntry) => h.content)
+      .join(" ")
+      .toLowerCase()
+    if (q.includes("balance") || recentHistoryText.includes("balance")) return null
     if (q.includes("credit") && (q.includes("debit") || q.includes("expense")))
       return "credits_vs_debits"
     if ((q.includes("monthly") || q.includes("month")) &&
@@ -1374,6 +1460,15 @@ export async function POST(request: Request) {
               encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`)
             )
 
+            // Neither of these was previously stated to this synthesis call at all — confirmed
+            // live as the mechanism behind two separate bugs: (1) with historyContext carrying an
+            // earlier turn's "balance" framing and no instruction distinguishing that from a
+            // debit/credit total, the model narrated net cash flow as if it were a balance; (2)
+            // with no grounding for what chart_type this specific response is actually rendering,
+            // the model could describe a different chart than the one produced here (e.g. one
+            // mentioned earlier in history). Both are stated explicitly now rather than left
+            // implicit.
+            const hasClosingBalance = rows.length > 0 && Object.prototype.hasOwnProperty.call(rows[0], "closing_balance")
             const synthesisStream = await openai.chat.completions.create({
               model: "gpt-4o-mini",
               temperature: 0.3,
@@ -1390,13 +1485,18 @@ Rules:
 - Always use ${currency} currency symbol for amounts
 - Use standard number formatting
 - Round amounts to nearest hundred unless exact matters
-- Never say "the data shows" or "based on the results"`,
+- Never say "the data shows" or "based on the results"
+- The data for THIS response is being rendered as a "${chartType}" chart in the UI — describe only
+  this chart, never a different chart type or figure mentioned earlier in the conversation above.
+- ${hasClosingBalance
+    ? `These results include the actual closing_balance column — you may describe this as the account "balance".`
+    : `These results do NOT include closing_balance — they are debit/credit/net totals, which is net cash flow for the period, NOT an account balance. Never use the word "balance" anywhere in this response, even if an earlier turn in the conversation above was about balance — describe this as spending, income, or net cash flow instead.`}`,
                 },
                 {
                   role: "user",
                   content: `Question: ${question || intentLabel}
 ${totalDebits > 0 || totalCredits > 0
-  ? `Pre-computed totals:
+  ? `Pre-computed totals (net cash flow, NOT a balance):
   Total debits: ${totalDebits.toFixed(2)}
   Total credits: ${totalCredits.toFixed(2)}`
   : ""}
@@ -1406,18 +1506,22 @@ Summarize these results accurately.`,
               ],
             })
 
+            // Buffered, not streamed chunk-by-chunk to the client — a chunk already sent can't be
+            // un-sent, and the balance-language guard below needs the complete text to check
+            // against the actual SQL before anything reaches the UI. The added latency (waiting
+            // for the full 1-2 sentence summary instead of watching it appear word-by-word) is the
+            // deliberate trade for a hard guarantee here, not a hopeful one.
             for await (const chunk of synthesisStream) {
-              const text = chunk.choices[0]?.delta?.content ?? ""
-              if (text) {
-                fullResponseText += text
-                controller.enqueue(
-                  encoder.encode(
-                    `data: ${JSON.stringify({ type: "text", text })}\n\n`
-                  )
-                )
-              }
+              fullResponseText += chunk.choices[0]?.delta?.content ?? ""
             }
 
+            const guardedResponseText = enforceBalanceLanguageGuard(fullResponseText.trim(), querySQL, {
+              userId, accountId: account_id, question: question || intentLabel, source: "prebuiltIntent",
+            })
+
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ type: "text", text: guardedResponseText })}\n\n`)
+            )
             controller.enqueue(encoder.encode("data: [DONE]\n\n"))
             controller.close()
 
@@ -1429,7 +1533,7 @@ Summarize these results accurately.`,
               is_custom: isCustom,
               sql: querySQL.trim(),
               results: rows,
-              response: fullResponseText,
+              response: guardedResponseText,
               chart_type: chartType,
               row_count: rows.length,
               cached: false,
