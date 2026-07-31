@@ -78,10 +78,13 @@ export function TurnCard({ turn, onSuggestionClick }: Props) {
             </span>
           )}
           {turn.used_memory && (
-            <span className="ml-2 inline-flex items-center gap-1
+            <span
+              className="ml-2 inline-flex items-center gap-1
                              rounded-full bg-purple-100 px-1.5 py-0.5
                              text-[10px] font-medium text-purple-700
-                             dark:bg-purple-900/30 dark:text-purple-400">
+                             dark:bg-purple-900/30 dark:text-purple-400 cursor-help"
+              title="This response used a confirmed pattern from your agent memory, built up from repeated observations over time — not the AI's training data."
+            >
               🧠 from memory
             </span>
           )}
