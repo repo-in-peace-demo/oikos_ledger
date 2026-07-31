@@ -1,7 +1,7 @@
 # ADR 013 — Voice Interface: OpenAI Realtime API over Alternatives
 
 **Date:** 2026-06-18
-**Status:** Accepted
+**Status:** Accepted (Amended 2026-07-31 — see Update below; original decision unchanged, scope extended)
 
 ---
 
@@ -89,3 +89,13 @@ Tools in session:
 - Session cost: billed per audio minute (input + output) at Realtime API rates
 - WebSocket connection must be managed carefully — reconnection, cleanup on unmount, disconnect on farewell
 - `NEXT_PUBLIC_VOICE_ENABLED=true` required to show voice button in UI
+
+---
+
+## Update — 2026-07-31
+
+The original decision (OpenAI Realtime API over the alternatives above) is unchanged. What changed is scope and implementation, not the choice recorded above:
+
+- **Scope**: voice was originally built for Insights only. Compare, Macro, and Recommendations each grew their own voice feature afterward, each independently copying the WebSocket/audio/turn-ordering mechanics described in this ADR's Architecture section — accumulating inconsistent fixes across four separate copies.
+- **Consolidation**: all four now share one implementation — `app/lib/voice/useRealtimeVoiceSession.ts` (the hook: connection, mic capture/playback, barge-in, turn-ordering, farewell/disconnect lifecycle) plus `app/components/voice/VoiceButton.tsx` (shared mic button/status bar/optional transcript, used directly by Compare and Macro; Insights and Recommendations keep their own page-specific UI but run on the same hook). See `docs/architecture.md` and `docs/ui.md`'s Voice Interface sections for the current implementation detail — this ADR's own Architecture section above reflects the original, Insights-only build and is kept as the historical record rather than rewritten in place.
+- **Bugs found and fixed during that consolidation**, none of which change the original decision: `conversation.item.truncate`'s `audio_end_ms` was read after the sample counter had already reset (always sent as 0); a barge-in could target an already-completed item ("item_id not found") or a `function_call` item with no audio (`unsupported_content_type`); the assistant's spoken text only ever populated once complete rather than streaming live; turn ordering could bunch two questions ahead of their answers when a tool call's backend fetch outlasted a quick follow-up question. All fixed in the shared hook.
