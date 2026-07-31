@@ -7,6 +7,8 @@ import { formatIndicatorValue } from "@/lib/macro/formatIndicator"
 import { InvestmentScenarioSlider, DEFAULT_RETURN } from "./InvestmentScenarioSlider"
 import { MacroVoiceButton, type MacroVoiceData } from "./MacroVoiceButton"
 import { MemoryPanel } from "./MemoryPanel"
+import { BalanceTrendChart } from "./BalanceTrendChart"
+import { PurchasingPowerGapChart } from "./PurchasingPowerGapChart"
 
 const INDICATOR_LABELS: Record<string, string> = {
   repo_rate: "RBI Repo Rate",
@@ -262,6 +264,37 @@ export function MacroPanel({ firstName }: Props) {
                     </div>
 
                     <MemoryPanel facts={facts} lastDistilledAt={lastDistilledAt} />
+                  </div>
+                )}
+
+                {hasIndicators && explanation && (
+                  <div className="rounded-xl border bg-card p-5 space-y-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700">Balance over time: nominal vs. real</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Your combined balance across visits, alongside what it&apos;s actually
+                        worth once inflation is accounted for.
+                      </p>
+                    </div>
+                    <BalanceTrendChart
+                      currencyCode={currency}
+                      inflationRatePct={inflationIndicator ? Number(inflationIndicator.value) : null}
+                    />
+                  </div>
+                )}
+
+                {/* Separate from the chart above on purpose — a structural jump there (an
+                    account being added) dominates that Y-axis and crushes the actual erosion gap
+                    to imperceptibility. Same underlying data, own appropriately-scaled axis. */}
+                {hasIndicators && explanation && inflationIndicator && (
+                  <div className="rounded-xl border bg-card p-5 space-y-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700">Purchasing power lost to inflation over time</p>
+                    </div>
+                    <PurchasingPowerGapChart
+                      currencyCode={currency}
+                      inflationRatePct={Number(inflationIndicator.value)}
+                    />
                   </div>
                 )}
               </section>
