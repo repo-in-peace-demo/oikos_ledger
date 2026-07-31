@@ -9,6 +9,7 @@ import { MacroVoiceButton, type MacroVoiceData } from "./MacroVoiceButton"
 import { MemoryPanel } from "./MemoryPanel"
 import { BalanceTrendChart } from "./BalanceTrendChart"
 import { PurchasingPowerGapChart } from "./PurchasingPowerGapChart"
+import { CollapsibleSection } from "@/components/ui/CollapsibleSection"
 
 const INDICATOR_LABELS: Record<string, string> = {
   repo_rate: "RBI Repo Rate",
@@ -316,6 +317,49 @@ export function MacroPanel({ firstName }: Props) {
                 />
               </section>
             )}
+
+            {/* Collapsed by default — mechanism depth for anyone who wants it, without adding
+                permanent clutter to an already-dense page. Text below is copied verbatim from
+                the voice assistant's own system prompt (app/api/macro/query/route.ts's
+                SYSTEM_PROMPT "How the comparison/memory mechanism itself works" bullet) and the
+                chart's own caption (BalanceTrendChart.tsx) — kept in sync by hand, not
+                paraphrased, so this section can never say something different from what the
+                voice assistant says aloud. MIN_OCCURRENCES_FOR_TREND in that route.ts is 3;
+                update the "3" below too if that value ever changes. */}
+            <section>
+              <CollapsibleSection label="How this works">
+                <p>
+                  Every real visit to this page is logged as an immutable &quot;episodic
+                  event&quot; — a permanent record of the combined balance observed that one time.
+                </p>
+                <p>
+                  A &quot;semantic fact&quot; (what&apos;s shown as a memory fact above) is the
+                  conclusion drawn once enough episodic events agree with each other — e.g. that
+                  the balance has consistently increased, and for how many checks in a row.
+                </p>
+                <p>
+                  &quot;Distillation&quot; is the scheduled background process that periodically
+                  reads the log of episodic events and either promotes a pattern to a semantic
+                  fact, updates an existing one, or lets a fact that hasn&apos;t been reinforced
+                  recently decay in relevance over time.
+                </p>
+                <p>
+                  The confirmation threshold is a fixed number, not an estimate: a pattern needs
+                  to be observed 3 separate times before it&apos;s promoted from
+                  &quot;tentative&quot; to &quot;confirmed&quot;.
+                </p>
+                <p className="pt-1 border-t">
+                  &quot;Real&quot; approximates today&apos;s purchasing power the same simple way
+                  as the erosion estimate on the chart above: your earliest recorded balance
+                  losing value at the current inflation rate every year since then, assuming it
+                  stayed in a low-interest account — not compounded, and not a forecast. In plain
+                  terms: take your very first recorded balance, multiply it by the current
+                  inflation rate, then by how many years have passed since that first snapshot —
+                  that&apos;s the amount subtracted from today&apos;s actual balance to get the
+                  &quot;real&quot; figure.
+                </p>
+              </CollapsibleSection>
+            </section>
           </>
         )}
       </div>
