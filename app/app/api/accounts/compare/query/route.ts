@@ -122,12 +122,22 @@ seen this once or twice so far, so take it with a grain of salt"). Never infer c
 occurrence_count itself, and never compare one fact's occurrence_count against another fact's in \
 the same response — a "confirmed" fact with occurrence_count 4 and a "confirmed" fact with \
 occurrence_count 27 are BOTH stated with equal confidence; the exact count is supplementary \
-detail, not something that downgrades the confidence framing on its own. Example tone, showing \
-two confirmed facts with very different counts stated equally confidently, alongside one genuinely \
-tentative fact: "Axis has run higher than HDFC in Shopping for 27 straight checks, and in \
-Utilities for 4 — I'm confident about both of those. Groceries I've only seen once so far, so \
-take that with a grain of salt." If there are no memory facts yet, say plainly that nothing is \
-confirmed yet rather than falling back to raw totals or inventing one.
+detail, not something that downgrades the confidence framing on its own. HOWEVER, "supplementary" \
+does not mean optional: when a group (same higher account) has more than one category, you MUST \
+state EVERY category's own occurrence_count individually — never fold two or more categories \
+into one undifferentiated list ("Axis has run higher in Other, Shopping, and Utilities") without \
+each one's own count attached, even though they're all confirmed and all stated with equal \
+confidence. Confirmed with confidence is Yes/No — that never depends on the count; the count \
+itself must always be surfaced per category, one axis (confidence) never subsumes the other \
+(the actual number of checks), because two categories that happen to share a higher account can \
+still have wildly different amounts of evidence behind them (e.g. 8 checks vs. 31), and a listener \
+has no way to tell that apart if the counts aren't spoken. Example tone, showing three confirmed \
+facts in the same higher-account group with very different counts, each stated individually and \
+all with equal confidence, alongside one genuinely tentative fact: "Axis has run higher than HDFC \
+in Shopping for 27 straight checks, in Utilities for 31, and in Other for 8 — I'm confident about \
+all three of those. Groceries I've only seen once so far, so take that with a grain of salt." If \
+there are no memory facts yet, say plainly that nothing is confirmed yet rather than falling back \
+to raw totals or inventing one.
    - What this page/feature can do ("what can this do", "what does this page talk about"): \
 describe all three capabilities above — spend comparison, shared/unique categories, AND \
 confidence-scored memory of which account has run higher over time — don't just say it compares \
@@ -210,7 +220,10 @@ function buildUserContent(
 answering a question covering more than one category, use this grouping and these category \
 lists VERBATIM. Never re-derive who is higher in which category yourself by reading multiple \
 facts' description text — read each fact's description only for a single specific category \
-asked about directly:\n`
+asked about directly. Each category entry below carries its OWN occurrence_count — when a group \
+has more than one category, state every category's occurrence_count individually in your \
+response; never name two or more categories together without each one's own count, even though \
+they share the same higher account and the same confidence framing:\n`
     + `${JSON.stringify(groupedByHigherAccount, null, 2)}`
 }
 

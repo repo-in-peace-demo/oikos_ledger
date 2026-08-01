@@ -1,45 +1,70 @@
 // Data-change freshness check for query_cache — the same class of staleness problem already
-// solved for semantic_facts (see FACT_MARKER_TIMEOUT_MS in the insights query route), applied
-// here to transaction data. query_cache previously only expired on a fixed 24h TTL, with no
-// invalidation tied to actual writes: a transaction deleted or added between a cache write and a
-// later read would silently keep serving the pre-change answer until the TTL lapsed.
+// solved for semantic_facts caching (see getFactCandidatesMarker in
+// app/lib/insights/factCandidates.ts), applied here to query_cache as a whole. query_cache
+// previously only expired on a fixed 24h TTL, with no invalidation tied to actual writes: a
+// transaction deleted/added, or a fact newly confirmed/changed, between a cache write and a later
+// read would silently keep serving the pre-change answer until the TTL lapsed.
 //
 // Chose a marker over ad-hoc invalidation calls scattered across every write path (ingestion,
-// amendments, manual/admin deletes) for the same reason it was chosen for semantic_facts: a
-// scattered approach only works if every current and future write path remembers to call it —
-// a marker is enforced at the read side instead, so it can't be forgotten by a new write path.
+// amendments, manual/admin deletes, fact confirmation) for the same reason it was chosen for
+// semantic_facts elsewhere: a scattered approach only works if every current and future write
+// path remembers to call it — a marker is enforced at the read side instead, so it can't be
+// forgotten by a new write path.
 //
-// `transactions` has no updated_at (explicitly append-only per schema.ts), and confirmed by
-// reading the amendment flow directly: amendments write only to transaction_amendments (an audit
-// log) and the global merchants registry (for future ingestion) — a transaction's own row is
-// never mutated in place. So the only real write patterns are insert (new statement upload) and
-// delete (manual/admin action) — COUNT(*) alone is sensitive to both; MAX(created_at) is included
-// as a free extra signal against the narrow edge case of a delete-then-insert netting to the same
-// count.
+// The marker is a SINGLE combined value covering BOTH data sources this cache's answers depend
+// on, computed in one round trip:
+//   - transactions: `transactions` has no updated_at (explicitly append-only per schema.ts), and
+//     confirmed by reading the amendment flow directly: amendments write only to
+//     transaction_amendments (an audit log) and the global merchants registry (for future
+//     ingestion) — a transaction's own row is never mutated in place. So the only real write
+//     patterns are insert (new statement upload) and delete (manual/admin action) — COUNT(*)
+//     alone is sensitive to both; MAX(created_at) is included as a free extra signal against the
+//     narrow edge case of a delete-then-insert netting to the same count.
+//   - semantic_facts: MAX(updated_at) across exactly the rows a cached response could have used
+//     as memory context (confirmed, not superseded, scoped to this user + account-or-user-level —
+//     same scoping as getFactCandidatesMarker) — changes precisely when a new fact confirms, an
+//     existing confirmed fact updates, or one gets superseded. This was the actual gap that let
+//     two phrasings of the same question ("last 30 days" vs "last thirty days") disagree on
+//     memory usage: the marker only ever tracked transactions, so a response cached before a fact
+//     confirmed stayed "fresh" indefinitely even though the memory state had since moved — the
+//     OTHER phrasing (a fresh cache miss) picked up the newly-confirmed fact immediately, and the
+//     two diverged.
+//
+// A mismatch on EITHER half means stale — the combined marker only matches when both are
+// unchanged since the entry was written.
 import { dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import { logError } from "@/lib/logger"
 
-const TRANSACTIONS_MARKER_TIMEOUT_MS = 300
+const QUERY_CACHE_MARKER_TIMEOUT_MS = 300
 
-async function getTransactionsDataMarker(userId: string, accountId: string): Promise<string> {
+async function getQueryCacheDataMarker(userId: string, accountId: string): Promise<string> {
   const result = (await dbReadonly.execute(sql.raw(`
-    SELECT COUNT(*) AS row_count, MAX(created_at) AS latest
-    FROM transactions
-    WHERE user_id = '${userId}' AND account_id = '${accountId}'
-  `))) as unknown as { rows: { row_count: string; latest: string | null }[] }
+    SELECT
+      (SELECT COUNT(*) FROM transactions
+        WHERE user_id = '${userId}' AND account_id = '${accountId}') AS txn_count,
+      (SELECT MAX(created_at) FROM transactions
+        WHERE user_id = '${userId}' AND account_id = '${accountId}') AS txn_latest,
+      (SELECT MAX(updated_at) FROM semantic_facts
+        WHERE user_id = '${userId}'
+          AND (account_id IS NULL OR account_id = '${accountId}')
+          AND confidence_status = 'confirmed'
+          AND superseded_by IS NULL) AS facts_marker
+  `))) as unknown as {
+    rows: { txn_count: string; txn_latest: string | null; facts_marker: string | null }[]
+  }
   const row = result.rows[0]
-  return `${row.row_count}:${row.latest ?? ""}`
+  return `${row.txn_count}:${row.txn_latest ?? ""}|${row.facts_marker ?? ""}`
 }
 
 // Same hard-timeout + degrade pattern used throughout the insights query route: a failure or
 // timeout here is treated as "unknown", which the caller must treat as "cannot verify — do not
 // serve this cache entry", not as a pass.
-export async function getTransactionsDataMarkerOrUnknown(
+export async function getQueryCacheDataMarkerOrUnknown(
   userId: string,
   accountId: string,
 ): Promise<string | "unknown"> {
-  const work = getTransactionsDataMarker(userId, accountId)
+  const work = getQueryCacheDataMarker(userId, accountId)
   work.catch(() => {})
 
   let timedOut = false
@@ -47,15 +72,15 @@ export async function getTransactionsDataMarkerOrUnknown(
     setTimeout(() => {
       timedOut = true
       resolve("timeout")
-    }, TRANSACTIONS_MARKER_TIMEOUT_MS)
+    }, QUERY_CACHE_MARKER_TIMEOUT_MS)
   })
 
   try {
     const result = await Promise.race([work, timeout])
     if (timedOut) {
       logError({
-        context: "getTransactionsDataMarkerOrUnknown",
-        error: new Error(`Marker check exceeded ${TRANSACTIONS_MARKER_TIMEOUT_MS}ms budget`),
+        context: "getQueryCacheDataMarkerOrUnknown",
+        error: new Error(`Marker check exceeded ${QUERY_CACHE_MARKER_TIMEOUT_MS}ms budget`),
         userId,
         accountId,
         note: "treating as unknown — cache reads will be treated as a miss",
@@ -65,7 +90,7 @@ export async function getTransactionsDataMarkerOrUnknown(
     return result as string
   } catch (err) {
     logError({
-      context: "getTransactionsDataMarkerOrUnknown",
+      context: "getQueryCacheDataMarkerOrUnknown",
       error: err,
       userId,
       accountId,
