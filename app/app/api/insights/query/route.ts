@@ -3,7 +3,7 @@ import { db, dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import OpenAI from "openai"
 import { logError } from "@/lib/logger"
-import { getTransactionsDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
+import { getQueryCacheDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
 import { loadFactCandidates } from "@/lib/insights/factCandidates"
 
 export const dynamic = "force-dynamic"
@@ -563,11 +563,12 @@ async function getExactCacheHit(
 
     const cached = result.rows[0].result as Record<string, unknown>
     // TTL alone doesn't catch data changes within the 24h window — a transaction deleted or
-    // added after this entry was written would otherwise keep being served verbatim. Compares
-    // against the marker stored at write time (see writeCacheEntry); a mismatch (including an
-    // older entry that predates this fix and has no stored marker at all) means stale — fall
-    // through to a fresh computation rather than serve it.
-    const currentMarker = await getTransactionsDataMarkerOrUnknown(userId, accountId)
+    // added, or a semantic fact newly confirmed/changed, after this entry was written would
+    // otherwise keep being served verbatim. Compares against the marker stored at write time
+    // (see writeCacheEntry); a mismatch (including an older entry that predates this fix and has
+    // no stored marker at all) means stale — fall through to a fresh computation rather than
+    // serve it.
+    const currentMarker = await getQueryCacheDataMarkerOrUnknown(userId, accountId)
     if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
       return null
     }
@@ -647,7 +648,7 @@ async function writeCacheEntry(
     // "unknown" (timeout/failure) is stored as null, not a placeholder string — null can never
     // equal a real marker value on a later read, so an entry written under an unverifiable
     // baseline is permanently treated as stale rather than accidentally trusted later.
-    const dataMarker = await getTransactionsDataMarkerOrUnknown(userId, accountId)
+    const dataMarker = await getQueryCacheDataMarkerOrUnknown(userId, accountId)
     const payload = {
       ...responseData,
       _data_marker: dataMarker === "unknown" ? null : dataMarker,
