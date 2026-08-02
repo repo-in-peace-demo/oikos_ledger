@@ -350,20 +350,41 @@ export function MacroPanel({ firstName }: Props) {
               </section>
             )}
 
-            {/* Action — the one interactive thing the page invites you to do */}
+            {/* Action — the one interactive thing the page invites you to do. Gated on an actual
+                combined_balance (not just hasIndicators/hasBalanceInfo) — a fresh account with no
+                uploaded statements yet has hasBalanceInfo: true (via accounts_without_data) but no
+                real balance to seed the slider with, which previously rendered a degenerate "moved
+                ₹0... increase by ~₹0/year" scenario instead of an honest empty state. The breakeven
+                line is genuinely balance-independent (a fact about the inflation rate alone), but
+                it's gated here together with the slider rather than shown on its own: it lives
+                inside InvestmentScenarioSlider's own markup, and a lone stat with no interactive
+                control to attach it to would read as a disjointed partial view rather than the one
+                clean empty state the rest of this page uses elsewhere (see "No macro data yet"
+                above). */}
             {hasIndicators && inflationIndicator && (
               <section className="space-y-4">
                 <div className="space-y-1">
                   <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">What you can do about it</p>
                 </div>
-                <InvestmentScenarioSlider
-                  amount={scenarioAmount}
-                  onAmountChange={setScenarioAmount}
-                  assumedReturn={scenarioAssumedReturn}
-                  onAssumedReturnChange={setScenarioAssumedReturn}
-                  inflationRate={Number(inflationIndicator.value)}
-                  currencyCode={currency}
-                />
+                {balances.combined_balance ? (
+                  <InvestmentScenarioSlider
+                    amount={scenarioAmount}
+                    onAmountChange={setScenarioAmount}
+                    assumedReturn={scenarioAssumedReturn}
+                    onAssumedReturnChange={setScenarioAssumedReturn}
+                    inflationRate={Number(inflationIndicator.value)}
+                    currencyCode={currency}
+                  />
+                ) : (
+                  <div className="flex flex-col h-48 items-center justify-center gap-2 text-center">
+                    <p className="text-3xl">💡</p>
+                    <p className="font-semibold text-slate-700">Nothing to explore yet</p>
+                    <p className="text-sm text-muted-foreground max-w-sm">
+                      Once you&apos;ve uploaded a bank statement, you can explore how investing your
+                      idle cash could offset inflation here.
+                    </p>
+                  </div>
+                )}
               </section>
             )}
           </>
