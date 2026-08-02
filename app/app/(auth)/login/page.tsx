@@ -22,7 +22,7 @@ export default function LoginPage() {
           Oikos Recall
         </CardTitle>
         <p className="text-xs text-muted-foreground">An extension of Oikos Ledger</p>
-        <CardDescription>Your household financial intelligence</CardDescription>
+        <CardDescription>Your personal financial intelligence with memory</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <Button
