@@ -1,5 +1,5 @@
 import { auth } from "@/auth"
-import { and, desc, eq, sql } from "drizzle-orm"
+import { and, desc, eq, lte, sql } from "drizzle-orm"
 import { db } from "@/lib/db/client"
 import { transactions } from "@/lib/db/schema"
 
@@ -23,6 +23,10 @@ export async function GET(request: Request) {
 
   const monthKeyExpr = sql<string>`TO_CHAR(${transactions.transaction_date}, 'YYYY-MM')`
 
+  // Excludes future-dated rows — TransactionsPanel defaults to availableMonths[0] (the most
+  // recent entry here) whenever nothing is explicitly selected yet, so without this bound a fresh
+  // session would land straight on a future month from seed/demo data extending past today (e.g.
+  // seeded through Sep 15 to cover an uncertain judging window) instead of the real current month.
   const rows = await db
     .selectDistinct({ month_key: monthKeyExpr })
     .from(transactions)
@@ -30,6 +34,7 @@ export async function GET(request: Request) {
       and(
         eq(transactions.user_id, session.user.id),
         eq(transactions.account_id, account_id),
+        lte(transactions.transaction_date, sql`CURRENT_DATE`),
       ),
     )
     .orderBy(desc(monthKeyExpr))

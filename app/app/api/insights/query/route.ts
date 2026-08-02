@@ -1242,9 +1242,17 @@ export async function POST(request: Request) {
 
   const dedupedHistory = dedupeConsecutive(conversation_history ?? [])
 
+  // date_to defaults to CURRENT_DATE rather than being left unbounded when absent — the pre-built
+  // intents below (and monthly_trend's own granularity-detection query) are plain SQL templates,
+  // not LLM-generated (unlike runAgentLoop, whose AGENT_SYSTEM_PROMPT already explicitly requires
+  // "AND transaction_date <= CURRENT_DATE" on every query it writes). Without this default, a
+  // pre-built intent run with no explicit date filter would include future-dated seed/demo data
+  // (e.g. seeded ahead through Sep 15 to cover an uncertain judging window) as if it had already
+  // happened. An explicit date_to from the UI's own date picker still wins — this only fills the
+  // gap when nothing was explicitly requested.
   const dateFilter = [
     date_from ? `AND transaction_date >= '${date_from}'` : "",
-    date_to ? `AND transaction_date <= '${date_to}'` : "",
+    date_to ? `AND transaction_date <= '${date_to}'` : "AND transaction_date <= CURRENT_DATE",
   ].join(" ")
 
   const dateContext = date_from || date_to

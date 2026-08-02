@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm"
+import { and, desc, eq, inArray, lte, sql } from "drizzle-orm"
 import { db } from "@/lib/db/client"
 import { merchants, transaction_amendments, transactions, uploads } from "@/lib/db/schema"
 import type { UploadStatus } from "@/types"
@@ -20,6 +20,10 @@ export async function getTransactionsByAccount(
 
 // Most recent closing balance for an account, and the YYYY-MM month it's from. Returns null if
 // the account has no transactions at all (caller should exclude it, not treat it as a zero balance).
+// Excludes future-dated rows (transaction_date > CURRENT_DATE) — demo/seed data can legitimately
+// extend past today (e.g. to cover an uncertain judging window), and without this filter the
+// "latest" balance would jump straight to that future date's figure instead of gradually catching
+// up to it as real time passes, defeating the point of seeding ahead.
 export async function getLatestAccountBalance(userId: string, accountId: string): Promise<{
   closing_balance: number
   as_of_month: string
@@ -30,7 +34,11 @@ export async function getLatestAccountBalance(userId: string, accountId: string)
       transaction_date: transactions.transaction_date,
     })
     .from(transactions)
-    .where(and(eq(transactions.user_id, userId), eq(transactions.account_id, accountId)))
+    .where(and(
+      eq(transactions.user_id, userId),
+      eq(transactions.account_id, accountId),
+      lte(transactions.transaction_date, sql`CURRENT_DATE`),
+    ))
     .orderBy(desc(transactions.transaction_date), desc(transactions.row_number))
     .limit(1)
 

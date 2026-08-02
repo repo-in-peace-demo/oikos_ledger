@@ -90,12 +90,18 @@ export async function POST(req: Request) {
   let isStale = false
 
   if (!hasCurrentMonthSpend) {
+    // CURRENT_DATE upper bound matters here specifically: without it, MAX(transaction_date) could
+    // return a future-dated month from seed/demo data extending past today (e.g. seeded through
+    // Sep 15 to cover an uncertain judging window), making the fallback jump straight to that
+    // future month as if it were the most recently completed one — the same class of bug as
+    // Macro's "latest balance," just for "most recent uploaded month" instead.
     const { rows: recentMonthRows } = await db.execute(sql.raw(`
       SELECT TO_CHAR(MAX(transaction_date), 'YYYY-MM') AS recent_month
       FROM transactions
       WHERE user_id = '${userId}'
         AND account_id = '${account_id}'
         AND transaction_type = 'debit'
+        AND transaction_date <= CURRENT_DATE
     `))
 
     const recentMonth = (recentMonthRows[0] as any)?.recent_month as string | null

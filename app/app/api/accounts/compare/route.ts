@@ -1,5 +1,5 @@
 // Compares distilled memory (episodic_events + semantic_facts) across two or more of the user's accounts
-import { and, eq, gte, sql } from "drizzle-orm"
+import { and, eq, gte, lte, sql } from "drizzle-orm"
 import { after } from "next/server"
 import { auth } from "@/auth"
 import { db, dbReadonly } from "@/lib/db/client"
@@ -166,6 +166,13 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
 // queried directly via the app's own db client (same as /api/analytics), not mcpSelectQuery,
 // since transactions is a normal high-traffic table the app already has full grants on; MCP reads
 // in this route are reserved for the memory tables (episodic_events/semantic_facts).
+//
+// Upper-bounded at CURRENT_DATE as well as lower-bounded at `since` — demo/seed data can
+// legitimately extend past today (e.g. to cover an uncertain judging window), and without the
+// upper bound this "trailing 30 days" window would also sum up future-dated rows that haven't
+// happened yet, inflating both the live category_deltas and the category_spend_snapshot events
+// this feeds into distillation (which would otherwise bake the inflated total into a
+// category_baseline fact's running_mean).
 async function getCategorySpendTotals(
   userId: string,
   accountId: string,
@@ -182,6 +189,7 @@ async function getCategorySpendTotals(
       eq(transactions.account_id, accountId),
       eq(transactions.transaction_type, "debit"),
       gte(transactions.transaction_date, since),
+      lte(transactions.transaction_date, sql`CURRENT_DATE`),
     ))
     .groupBy(transactions.category)
 
