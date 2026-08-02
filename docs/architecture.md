@@ -52,8 +52,10 @@ Browser
 **Key pages:**
 - `/` — Dashboard with transaction list, filter bar, amendment modal, upload flow
 - `/insights` — Chat interface for natural language financial queries (text + voice)
-- `/recommendations` — On-demand AI spending recommendations vs RBI benchmarks
+- `/recommendations` — On-demand AI spending recommendations against the user's own 3-month rolling baseline per category (self-referential, not benchmarked against RBI or any external data — see `docs/api.md`'s Recommendations section for the exact projection logic)
 - `/analytics` — Multi-tab deterministic analytics: top merchants, payment methods over time, subcategories, debit vs credit
+- `/macro` — Macro economic context (RBI/World Bank/MoSPI indicators), a personalized purchasing-power erosion synthesis, an investment scenario slider, a balance-trend memory panel, nominal-vs-real and purchasing-power-gap charts, and voice narration
+- `/compare` — Side-by-side comparison of two of the user's bank accounts: category spend deltas, shared/unique categories, a confidence-scored memory of which account has consistently run higher per category, and voice narration
 
 **Constants layer** — `app/lib/constants/`:
 - `banks.ts` — 4 supported Indian banks (HDFC, Axis, ICICI, SBI) with display names and domains

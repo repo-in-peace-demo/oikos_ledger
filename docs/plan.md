@@ -255,7 +255,7 @@ Oikos Ledger is a personal finance intelligence app for Indian bank account hold
 
 ### Deviations and Notes
 
-- **Voice not added to recommendations** — the recommendations panel uses a dedicated chat-style UI without an OpenAI Realtime connection. Streaming SSE from `POST /api/recommendations` delivers cards progressively; voice deferred.
+- **Voice not added to recommendations at the time of this iteration** — the recommendations panel originally used a dedicated chat-style UI without an OpenAI Realtime connection, with streaming SSE from `POST /api/recommendations` delivering cards progressively. This has since changed: `RecommendationsPanel.tsx` now has working voice narration via the shared `useRealtimeVoiceSession` hook (added in the CockroachDB × AWS Hackathon Submission Period, alongside Macro/Compare voice) — see `docs/architecture.md`'s Voice Interface section and `docs/ui.md`. Unlike Compare/Macro's `ask_*` tool pattern, it has no tool-calling at all: the full recommendations dataset is baked into the realtime session's instructions once at connect time.
 - **`insufficient_data` guard** — if the account has no transactions, the route returns an empty recommendations list with `insufficient_data: true` rather than calling the LLM.
 
 ---

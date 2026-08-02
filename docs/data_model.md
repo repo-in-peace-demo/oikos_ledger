@@ -350,13 +350,13 @@ users ──< voice_sessions ──< voice_messages
 
 | Table | Column | Index type | Purpose |
 |---|---|---|---|
-| `transactions` | `embedding` | HNSW (pgvector) | Approximate nearest-neighbour semantic search |
-| `merchants` | `location` | GIST (PostGIS) | Radius/bounding-box geospatial queries |
+| `transactions` | `embedding` | CockroachDB Distributed Vector Indexing (native `VECTOR` index, see ADR 014) | Approximate nearest-neighbour semantic search |
+| `merchants` | `location` | GIST (PostGIS-compatible) | Radius/bounding-box geospatial queries |
 | `transactions` | `transaction_date` | BRIN | Time-series range scans |
-| `query_cache` | `query_embedding` | HNSW (pgvector) | Cosine similarity cache hit detection |
+| `query_cache` | `query_embedding` | CockroachDB Distributed Vector Indexing (native `VECTOR` index, see ADR 014) | Cosine similarity cache hit detection |
 | `query_cache` | `query_hash` | B-tree | Exact text-hash lookup |
 
-Indexes added via migration once ingestion pipeline is writing data.
+**Status, honestly stated:** none of the above are actually created yet — `app/lib/db/schema.ts` defines no index of any kind beyond the unique constraints already listed elsewhere in this doc, and no migration files exist in the repo. This table describes the intended indexing strategy, not current state. It matters least for `merchants.location`/GIST specifically, since geocoding itself is an unimplemented stub (`ingestion/pipeline/geocoder.py` always returns `None`) and no radius/bounding-box query exists anywhere in the app yet to benefit from it. The vector-index rows matter more in practice, since similarity queries against `query_cache.query_embedding` and (previously) `transactions.embedding` are live — at current hackathon-demo data volumes a full scan is fast enough that the absence hasn't been observed as a problem, but it should be created before this is treated as production-ready.
 
 ---
 

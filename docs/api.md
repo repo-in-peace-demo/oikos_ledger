@@ -539,3 +539,124 @@ Returns personalised spending recommendations benchmarked against the user's own
 
 **Insufficient data:**
 - Returns `insufficient_data: true` if the user has no transactions, or if there is data but no baseline months (only one month of history, nothing to compare against).
+
+---
+
+## Macro
+
+### GET /api/macro
+
+Returns economic indicators, a personalised erosion synthesis, the user's balance summary, and confirmed balance-trend memory facts. Not streaming.
+
+**Response:**
+```json
+{
+  "indicators": [
+    { "indicator": "inflation", "value": 5.2, "period": "2026-Q1", "source": "mospi", "display_value": "5.20%" }
+  ],
+  "facts": [
+    { "id": "uuid", "fact_type": "trend:balance_snapshot", "category": null, "description": "...", "confidence_status": "confirmed", "occurrence_count": 4, "updated_at": "..." }
+  ],
+  "explanation": "Your idle cash is losing roughly ₹X a year to inflation...",
+  "already_explained": false,
+  "balances": {
+    "state": "blended_clean",
+    "combined_balance": 145230.50,
+    "reference_month": "2026-06",
+    "accounts": [ { "account_id": "uuid", "balance": 90000, "as_of_month": "2026-06", "excluded_from_blend": false } ]
+  },
+  "currency": "INR",
+  "last_distilled_at": "2026-06-20T10:00:00Z",
+  "gdp_per_capita_age_note": "4 months old — more recent figures not yet published",
+  "repo_rate_unchanged_note": "Unchanged since 2026-02"
+}
+```
+
+**Notes:**
+- `balances.state` is one of `blended_clean` (accounts' `as_of_month` within 1 month of each other — summed cleanly), `blended_with_caveat` (within 3 months — summed, with `recency_mismatch: true`), or `not_blended` (an account is more than 6 months stale, or the spread exceeds 3 months — shown per-account only, no combined figure).
+- Indicator values are pre-formatted server-side into `display_value` — voice/text responses are instructed to use this string verbatim rather than reformatting the raw `value`.
+- Writes a `macro_explanation` episodic event (throttled to once per hour) that feeds the distillation job's balance-trend detection — not on the response's critical path.
+- Facts are served from a marker-based cache (`app/lib/macro/balanceFacts.ts`) shared with `POST /api/macro/query` below, scoped to `trend:balance_snapshot` facts only.
+- Degrades to indicators-only (empty `facts`) if the Managed MCP Server is unreachable.
+
+### GET /api/macro/balance-history
+
+Returns the user's combined-balance history for the two Macro charts (nominal-vs-real trend, purchasing-power gap). Read-only.
+
+**Response:**
+```json
+{
+  "points": [
+    { "timestamp": "2026-04-01T09:00:00Z", "nominal_balance": 120000, "account_ids": ["uuid1"], "account_set_changed": false },
+    { "timestamp": "2026-05-15T09:00:00Z", "nominal_balance": 210000, "account_ids": ["uuid1", "uuid2"], "account_set_changed": true }
+  ]
+}
+```
+
+**Notes:**
+- `account_set_changed: true` marks a point where the set of accounts contributing to `nominal_balance` changed since the previous point (e.g. a new account added) — the UI renders a distinct marker here instead of letting it read as organic balance growth.
+- Extraction logic mirrors `distillation/pipeline/distiller.py`'s `_extract_balance_snapshots` by hand (Python/TS can't share this function across runtimes) — must be kept in sync manually if either changes.
+
+### POST /api/macro/query
+
+Voice/text handler backing the Macro page's `ask_macro` realtime tool. Not a SQL-generating agent — the table-shaped data (indicators, synthesis, scenario, balances) is passed in by the caller; the one thing this route fetches itself is a fresh read of the user's confirmed balance-trend facts (the caller's copy could be stale by the time a voice question is asked).
+
+**Request body:**
+```json
+{ "question": "What's my repo rate indicator?", "macro_data": { "...": "the full /api/macro response, plus the current scenario slider state" } }
+```
+
+**Response:**
+```json
+{ "tier": "answer", "response": "The RBI Repo Rate is currently 6.50%, as of ..." }
+```
+
+**Tiers:** `answer` (indicators, erosion synthesis, scenario math, memory facts, chart descriptions, or how the memory mechanism itself works — all answered only from provided/freshly-fetched data, confidence phrasing strictly from each fact's own `confidence_status`), `redirect` (financial but not Macro-specific — e.g. individual transactions — one-sentence redirect to Insights), `reject` (non-financial — fixed refusal, with a warm-acknowledgment exception for brief social remarks).
+
+---
+
+## Compare
+
+### POST /api/accounts/compare
+
+Compares distilled memory across two (or more, though the UI never sends more than two — see `docs/ui.md`) of the user's bank accounts.
+
+**Request body:**
+```json
+{ "account_ids": ["uuid1", "uuid2"] }
+```
+
+**Response:**
+```json
+{
+  "accounts": [
+    { "account_id": "uuid1", "label": "HDFC Bank (Primary)", "recent_events": [ { "id": "uuid", "event_type": "category_spend_snapshot", "content": "...", "created_at": "..." } ] }
+  ],
+  "category_deltas": [
+    { "category": "Food", "values": { "uuid1": 8200, "uuid2": 6100 }, "delta": 2100 }
+  ],
+  "category_baseline_window_days": 30,
+  "shared_categories": ["Food", "Shopping"],
+  "unique_categories": [ { "account_id": "uuid1", "categories": ["Travel"] } ],
+  "comparison_snapshots": [
+    { "id": "uuid", "category": "Food", "description": "HDFC Bank has run higher than Axis Bank in Food spending for 4 consecutive checks, over the past 2 weeks.", "occurrence_count": 4, "confidence_status": "confirmed", "updated_at": "...", "account_id": "uuid1", "compared_account_id": "uuid2", "running_mean": 2100 }
+  ]
+}
+```
+
+**Notes:**
+- Requires at least two `account_ids` owned by the requesting user; returns `400` otherwise. The Compare UI itself hard-caps selection at exactly two (`MAX_COMPARE_ACCOUNTS = 2`).
+- `category_deltas`' values are each account's distilled running mean for that category — a rolling `category_baseline_window_days`-day total, not an all-time figure (an all-time total would only ever grow, making repeat observations incomparable).
+- After the response is sent (`next/server`'s `after()`), records a `comparison_run` episodic event and per-category `category_spend_snapshot` events — these feed future distillation runs only, never the current response.
+- Account memory (`category_baseline` facts) and comparison-snapshot facts are each served from their own marker-based cache (`accountMemoryCache` inline in the route, and `app/lib/compare/comparisonSnapshots.ts` respectively).
+
+### POST /api/accounts/compare/query
+
+Voice/text handler backing the Compare page's `ask_compare` realtime tool. Same three-tier `answer`/`redirect`/`reject` shape as `/api/macro/query` above, scoped to this account pair's category deltas, shared/unique categories, and `trend:comparison_snapshot` memory facts (freshly queried by this route, not trusted from the caller's payload). A multi-category answer must use a server-computed "grouped by which account is higher" structure verbatim rather than reading multiple facts' free-text descriptions itself — and must state every category's own `occurrence_count` individually rather than folding several categories into one undifferentiated list, even when they share the same higher account and the same confidence framing.
+
+**Request body:**
+```json
+{ "question": "What have you noticed about my spending?", "compare_data": { "...": "the full POST /api/accounts/compare response" } }
+```
+
+**Response:** Same `{ tier, response }` shape as `/api/macro/query`.
