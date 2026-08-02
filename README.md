@@ -16,6 +16,8 @@ Everything built between **June 30 and August 18, 2026** — the CockroachDB × 
 - The CockroachDB-backed agentic memory layer
 - The Macro page
 - Two-account comparison (Compare page — currently hard-capped at exactly two accounts, both in the UI and structurally in the `semantic_facts` schema; not N-way)
+- Memory-grounded upgrades to the Insights agent (voice and text) — fact retrieval via CockroachDB vector similarity, tiered response caching
+- A shared voice architecture across all four voice-enabled pages (Insights, Macro, Compare, Recommendations) — consolidated four independent implementations into one hook, removing roughly 2,000 lines of duplicated code
 
 The pre-existing Oikos Ledger codebase — auth, core data model, UI shell — is unchanged and predates this period.
 
@@ -128,7 +130,7 @@ If you want to start fresh as a guest:
 
 **Note on vector similarity:** this isn't one mechanism — it's three, doing different jobs, and they shouldn't be collapsed into a single claim:
 
-- **`query_cache`'s Tier 2 similarity cache** (`getSimilarCacheHits`, and the voice-specific direct-serve path in `getVoiceSimilarCacheHit`) genuinely computes cosine similarity server-side inside CockroachDB via the `<=>` operator (`1 - (query_embedding <=> ...)`), with the database doing the ranking natively. This answers "is this whole question basically the same as one already answered" — text mode surfaces a match above 0.85 as a clickable suggestion; voice serves a match above a stricter 0.92 directly, with no suggestion step, since voice has no menu UX to confirm through.
+- **`query_cache`'s Tier 2 similarity cache** (`getSimilarCacheHits`, and the voice-specific direct-serve path in `getVoiceSimilarCacheHit`) genuinely computes cosine similarity server-side inside CockroachDB via the `<=>` operator (`1 - (query_embedding <=> ...)`), with the database doing the ranking natively. This answers "is this whole question basically the same as one already answered" — text mode surfaces a match above 0.85 as a clickable suggestion; voice serves a match above a stricter [0.92](https://www.spheron.network/blog/semantic-cache-llm-inference-gpu-cloud/) directly, with no suggestion step, since voice has no menu UX to confirm through.
 - **Insights' fact-grounding** (`getRelevantFactDescriptions`, which decides which confirmed memory facts ground a response) computes cosine similarity in **application code** against a cached candidate set, not via CockroachDB's `<=>` operator. This is a deliberate, safe design choice, not a regression: the confirmed-fact set for a user+account is cacheable (it only changes when distillation writes), but which facts match a specific question never is — caching the embeddings once per cache miss and scoring them in JavaScript on every question avoids sending a bulk-embedding query to the Managed MCP Server on every single question, which is exactly the shape that caused the response-size failure below.
 - **Macro and Compare** pass their confirmed facts directly to the LLM with no similarity search step at all — their candidate sets are structurally tiny by construction (Macro: one allow-listed fact type, one user, capped at 5 rows; Compare: scoped to exactly the two accounts being compared), so a ranking step over them wouldn't change what gets returned.
 
@@ -167,9 +169,9 @@ uv sync
 #### Frontend (`app/.env.local`)
 ```env
 # Database — CockroachDB Cloud (Postgres-wire-compatible; see ADR 014)
-DATABASE_URL=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
-DATABASE_URL_DIRECT=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
-DATABASE_URL_READONLY=postgresql://readonly_user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
+DATABASE_URL=cockroachdb://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=verify-full
+DATABASE_URL_DIRECT=cockroachdb://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=verify-full
+DATABASE_URL_READONLY=cockroachdb://readonly_user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=verify-full
 
 # CockroachDB Managed MCP Server (agentic memory reads/writes)
 COCKROACHDB_MCP_API_KEY=your-mcp-api-key
@@ -199,7 +201,7 @@ Note: guest login (`demo@oikosrecall.app`) needs no special environment variable
 
 #### Ingestion (`ingestion/.env`)
 ```env
-DATABASE_URL=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
+DATABASE_URL=cockroachdb://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
 AWS_S3_BUCKET=your-s3-bucket
 AWS_LAMBDA_FUNCTION_NAME=oikos-recall-ingestion
 OPENAI_API_KEY=sk-proj-...
