@@ -1,8 +1,8 @@
-# Oikos Ledger
+# Oikos Recall
 
 > *When did you last ask your bank statement a plain English question?*
 
-Oikos Ledger is a conversational personal finance app that turns Indian bank statements into charts, trends, and AI-powered spending insights — just by asking. Built for the AWS + Vercel Hackathon 2026 (Track 1 B2C).
+Oikos Recall is a conversational personal finance app that turns Indian bank statements into charts, trends, and AI-powered spending insights — just by asking. Built for the AWS + Vercel Hackathon 2026 (Track 1 B2C).
 
 **Live demo:** https://oikosledger.vercel.app
 
@@ -58,7 +58,7 @@ The Compare page (`/compare`) puts two of the user's bank accounts side by side 
 
 ## Architecture
 
-![Oikos Ledger Architecture](https://github.com/sl2902/oikos_ledger/blob/main/assets/oikos_recall_architecture_diagram.png)
+![Oikos Recall Architecture](https://github.com/sl2902/oikos_recall/blob/main/assets/oikos_recall_architecture_diagram.png)
 
 **Tech stack:**
 - Frontend: Next.js 15 App Router, TypeScript, Tailwind CSS, shadcn/ui — deployed on Vercel
@@ -71,7 +71,7 @@ The Compare page (`/compare`) puts two of the user's bank accounts side by side 
 
 ## Data model
 
-![Oikos Ledger Data Model](https://github.com/sl2902/oikos_ledger/blob/main/assets/oikos_ledger_er_v1.png)
+![Oikos Recall Data Model](https://github.com/sl2902/oikos_recall/blob/main/assets/oikos_ledger_er_v1.png)
 
 ---
 
@@ -94,7 +94,7 @@ Click **Try as Guest** on the login page. No Google account required. The guest 
 
 ### Testing the upload
 1. Sign in as guest (or with your own Google account)
-2. Download a sample statement: [`demo_hdfc_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_ledger/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv)
+2. Download a sample statement: [`demo_hdfc_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv)
 3. On the Transactions page, click **Upload Statement** in the top right corner
 4. Select HDFC Bank and upload the CSV
 5. Wait ~30–60 seconds for Lambda to process
@@ -150,8 +150,8 @@ This wasn't the original design for the fact-grounding case: an earlier version 
 ### Clone and install
 
 ```bash
-git clone https://github.com/<your-repo>/oikos_ledger.git
-cd oikos_ledger
+git clone https://github.com/<your-repo>/oikos_recall.git
+cd oikos_recall
 
 # Frontend
 cd app
@@ -189,19 +189,19 @@ OPENAI_REALTIME_API_KEY=sk-proj-...
 # AWS
 AWS_REGION=ap-south-1
 AWS_S3_BUCKET=your-s3-bucket
-AWS_LAMBDA_FUNCTION_NAME=oikos-ledger-ingestion
+AWS_LAMBDA_FUNCTION_NAME=oikos-recall-ingestion
 
 # Feature flags
 NEXT_PUBLIC_VOICE_ENABLED=true
 ```
 
-Note: guest login (`demo@oikosledger.app`) needs no special environment variable — it resolves its user id via a normal DB lookup by email, same as any other user. See step 2 of AWS setup below for creating the demo user row.
+Note: guest login (`demo@oikosrecall.app`) needs no special environment variable — it resolves its user id via a normal DB lookup by email, same as any other user. See step 2 of AWS setup below for creating the demo user row.
 
 #### Ingestion (`ingestion/.env`)
 ```env
 DATABASE_URL=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
 AWS_S3_BUCKET=your-s3-bucket
-AWS_LAMBDA_FUNCTION_NAME=oikos-ledger-ingestion
+AWS_LAMBDA_FUNCTION_NAME=oikos-recall-ingestion
 OPENAI_API_KEY=sk-proj-...
 OPENAI_BASE_URL=https://api.openai.com/v1
 ```
@@ -219,14 +219,14 @@ cd app
 npx drizzle-kit push
 ```
 
-Then create the demo guest user (no manual UUID wiring needed — guest login resolves `demo@oikosledger.app` via a normal DB lookup by email, same path every other user goes through):
+Then create the demo guest user (no manual UUID wiring needed — guest login resolves `demo@oikosrecall.app` via a normal DB lookup by email, same path every other user goes through):
 
 ```sql
 INSERT INTO users (email, first_name, last_name, country_code, currency)
-VALUES ('demo@oikosledger.app', 'Demo', 'User', 'IN', 'INR');
+VALUES ('demo@oikosrecall.app', 'Demo', 'User', 'IN', 'INR');
 
 INSERT INTO bank_accounts (user_id, bank_name, account_type, currency)
-VALUES ((SELECT id FROM users WHERE email = 'demo@oikosledger.app'), 'HDFC Bank', 'savings', 'INR');
+VALUES ((SELECT id FROM users WHERE email = 'demo@oikosrecall.app'), 'HDFC Bank', 'savings', 'INR');
 ```
 
 #### 3. S3 bucket
