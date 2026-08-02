@@ -15,7 +15,7 @@ export async function DELETE(
   }
 
   // Prevent guest user from deleting accounts
-  if (session.user.id === process.env.GUEST_USER_ID) {
+  if (session.user.isGuest) {
     return Response.json(
       { error: "Account deletion is disabled in guest mode." },
       { status: 403 }
