@@ -52,8 +52,11 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       name: "Guest",
       credentials: {},
       async authorize() {
+        // Real id is resolved from the DB by email in the jwt callback below — this placeholder
+        // is never used as a foreign key anywhere (signIn/jwt only ever read user.email), so it
+        // doesn't need to match any real row.
         return {
-          id: process.env.GUEST_USER_ID ?? "",
+          id: "guest",
           email: "demo@oikosledger.app",
           name: "Demo User",
         }
@@ -83,16 +86,21 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       return true
     },
 
-    // Runs on sign-in (user populated) and on every JWT refresh (user undefined).
+    // Runs on sign-in (user populated) and on every JWT refresh (user undefined). Always
+    // resolves the real user id by email — including for the guest user — rather than trusting a
+    // separately-configured id (an env var previously had to be kept in sync with whatever UUID
+    // the demo user row happened to get on creation, which is exactly the kind of thing that
+    // silently drifts: unset or mismatched, it produced a "logged in" session with an id that
+    // matched no real row, so every downstream `if (!session?.user?.id)` check — an empty string
+    // still passes that check — 401'd instead of failing loudly). The signIn callback above
+    // guarantees a row with this email exists (creates it if missing) before this ever runs.
     async jwt({ token, user }) {
-      if (user?.email === "demo@oikosledger.app") {
-        token["userId"] = process.env.GUEST_USER_ID ?? ""
-        token["isGuest"] = true
-        return token
-      }
       if (user?.email) {
         const dbUser = await getUserByEmail(user.email)
         if (dbUser) token["userId"] = dbUser.id
+        if (user.email === "demo@oikosledger.app") {
+          token["isGuest"] = true
+        }
       }
       return token
     },
