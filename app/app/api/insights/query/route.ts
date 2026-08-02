@@ -610,6 +610,55 @@ async function getSimilarCacheHits(
   }
 }
 
+// Voice's own version of Tier 2. The text-mode Tier 2 above (getSimilarCacheHits) only ever
+// offers a clickable "did you mean one of these?" menu — that confirmation-step UX doesn't exist
+// in a voice call, which is why Tier 2 was gated `!is_voice` entirely rather than caching helping
+// voice at all. Serving a match directly, with no human confirmation step, is a stronger claim
+// than offering it as a suggestion, so this uses a stricter threshold than the 0.85 above:
+// production semantic-caching guidance generally starts in the 0.90-0.95 range for exactly this
+// direct-serve case. Single best match only (LIMIT 1) — there's nothing to do with a second-best
+// candidate when there's no menu to show it in. Applies the same freshness-marker check Tier 1
+// (getExactCacheHit) already does before serving — a similar-but-stale entry shouldn't be served
+// any more than an exact-but-stale one should.
+const VOICE_TIER2_SIMILARITY_THRESHOLD = 0.92
+
+async function getVoiceSimilarCacheHit(
+  userId: string,
+  accountId: string,
+  embedding: number[],
+  queryHash: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const result = (await dbReadonly.execute(sql.raw(`
+      SELECT result,
+        1 - (query_embedding <=> '[${embedding.join(",")}]'::vector)
+          AS similarity
+      FROM query_cache
+      WHERE user_id = '${userId}'
+        AND account_id = '${accountId}'
+        AND query_hash != '${queryHash}'
+        AND expires_at > NOW()
+        AND 1 - (query_embedding <=> '[${embedding.join(",")}]'::vector) > ${VOICE_TIER2_SIMILARITY_THRESHOLD}
+      ORDER BY query_embedding <=> '[${embedding.join(",")}]'::vector
+      LIMIT 1
+    `))) as unknown as { rows: Record<string, unknown>[] }
+
+    if (result.rows.length === 0) {
+      return null
+    }
+
+    const cached = result.rows[0].result as Record<string, unknown>
+    const currentMarker = await getQueryCacheDataMarkerOrUnknown(userId, accountId)
+    if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
+      return null
+    }
+    return cached
+  } catch (err) {
+    logError({ context: "getVoiceSimilarCacheHit", error: err, userId, accountId, queryHash })
+    return null
+  }
+}
+
 async function getCacheByHash(
   userId: string,
   accountId: string,
@@ -1310,17 +1359,26 @@ export async function POST(request: Request) {
   // Generate embedding once — used for both Tier 2 and cache write
   const embedding = await generateEmbedding(cacheText)
 
-  // Tier 2: similarity search
-  const similarHits = await getSimilarCacheHits(userId, account_id, embedding, queryHash)
-  if (!is_voice && similarHits.length > 0) {
-    console.log("is_voice:", is_voice, "similar hits:", similarHits.length)
-    return Response.json({
-      type: "suggestions",
-      question: question || intent,
-      suggestions: similarHits,
-      response: "I found similar questions you've asked before. Would you like to use one of these?",
-      cached: false,
-    })
+  // Tier 2: similarity search — voice and text diverge here. Voice has no menu UX to show a
+  // "did you mean one of these?" suggestion in, so it gets its own direct-serve version (see
+  // getVoiceSimilarCacheHit) instead of running the text-mode query only to discard the result.
+  if (is_voice) {
+    const voiceSimilarHit = await getVoiceSimilarCacheHit(userId, account_id, embedding, queryHash)
+    if (voiceSimilarHit) {
+      return Response.json({ ...voiceSimilarHit, cached: true, type: "complete" })
+    }
+  } else {
+    const similarHits = await getSimilarCacheHits(userId, account_id, embedding, queryHash)
+    if (similarHits.length > 0) {
+      console.log("is_voice:", is_voice, "similar hits:", similarHits.length)
+      return Response.json({
+        type: "suggestions",
+        question: question || intent,
+        suggestions: similarHits,
+        response: "I found similar questions you've asked before. Would you like to use one of these?",
+        cached: false,
+      })
+    }
   }
 
   // Pre-built intent fast path — bypasses agent entirely
