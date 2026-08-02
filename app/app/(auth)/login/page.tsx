@@ -19,9 +19,10 @@ export default function LoginPage() {
     <Card className="w-full max-w-sm">
       <CardHeader className="space-y-1 text-center">
         <CardTitle className="text-2xl font-bold tracking-tight">
-          Oikos Ledger
+          Oikos Recall
         </CardTitle>
-        <CardDescription>Your household financial intelligence</CardDescription>
+        <p className="text-xs text-muted-foreground">An extension of Oikos Ledger</p>
+        <CardDescription>Your personal financial intelligence with memory</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <Button
