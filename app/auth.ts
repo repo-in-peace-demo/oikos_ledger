@@ -20,6 +20,8 @@ import { createUser, getUserByEmail } from "@/lib/db/queries/users"
 import { db } from "@/lib/db/client"
 import { users } from "@/lib/db/schema"
 
+const demoEmailUser = "demo@oikosrecall.app"
+
 declare module "next-auth" {
   interface Session {
     user: {
@@ -57,7 +59,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         // doesn't need to match any real row.
         return {
           id: "guest",
-          email: "demo@oikosledger.app",
+          email: demoEmailUser,
           name: "Demo User",
         }
       },
@@ -98,7 +100,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       if (user?.email) {
         const dbUser = await getUserByEmail(user.email)
         if (dbUser) token["userId"] = dbUser.id
-        if (user.email === "demo@oikosledger.app") {
+        if (user.email === demoEmailUser) {
           token["isGuest"] = true
         }
       }
