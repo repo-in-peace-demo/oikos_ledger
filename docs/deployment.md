@@ -19,8 +19,8 @@ Deployments are triggered automatically on push to `main`.
 |---|---|
 | `DATABASE_URL` | CockroachDB Cloud Postgres-wire-compatible connection string |
 | `AUTH_SECRET` | NextAuth JWT signing secret |
-| `AUTH_GOOGLE_ID` | Google OAuth client ID |
-| `AUTH_GOOGLE_SECRET` | Google OAuth client secret |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
 | `OPENAI_API_KEY` | OpenAI proxy key (dataexpert.io) — or omit to use direct |
 | `OPENAI_BASE_URL` | Proxy base URL — omit to use `api.openai.com` directly |
 | `OPENAI_REALTIME_API_KEY` | Direct OpenAI key (`sk-proj-...`) — used when `OPENAI_BASE_URL` is unset |

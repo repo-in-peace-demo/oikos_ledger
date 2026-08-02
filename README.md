@@ -15,7 +15,7 @@ This project extends [Oikos Ledger](https://github.com/sl2902/oikos_ledger), a p
 Everything built between **June 30 and August 18, 2026** — the CockroachDB × AWS Hackathon Submission Period — is new:
 - The CockroachDB-backed agentic memory layer
 - The Macro page
-- Multi-account comparison
+- Two-account comparison (Compare page — currently hard-capped at exactly two accounts, both in the UI and structurally in the `semantic_facts` schema; not N-way)
 
 The pre-existing Oikos Ledger codebase — auth, core data model, UI shell — is unchanged and predates this period.
 
@@ -24,21 +24,46 @@ The pre-existing Oikos Ledger codebase — auth, core data model, UI shell — i
 ## What it does
 
 - **Multi-bank ingestion** — upload CSV statements from HDFC, ICICI, and Axis Bank. The pipeline parses each bank's unique format, normalises merchant names, categorises transactions, and validates opening and closing balances row by row.
-- **Conversational insights** — ask questions in plain English or by voice. The app translates natural language to SQL, queries Aurora PostgreSQL, and renders charts. Repeated queries are served from a pgvector semantic cache — no LLM call needed.
-- **Spending recommendations** — a rolling 3-month baseline per discretionary category projects end-of-month spend. Overspending cards show which merchants are driving it and what to do before month end.
+- **Conversational insights** — ask questions in plain English or by voice. The app translates natural language to SQL, queries CockroachDB, and renders charts. Repeated queries are served from a vector-similarity cache — no LLM call needed.
+- **Spending recommendations** — a rolling 3-month baseline per discretionary category projects end-of-month spend. Overspending cards show which merchants are driving it and what to do before month end. This is entirely self-referential (your own history against itself) — it does not benchmark against RBI or any external data.
 - **Multi-dimensional analytics** — spend by merchant, payment method, subcategory, and debit vs credit trend across selectable date ranges.
-- **Voice advisor** — OpenAI Realtime API enables spoken queries with personalised, data-driven responses and built-in guardrails.
+- **Macro economic context** — RBI, World Bank, and MoSPI indicators (repo rate, inflation, food inflation, GDP growth, GDP per capita) combined with your own balance into a personalised purchasing-power erosion narrative, an investment scenario slider, and a growing memory of your balance trend.
+- **Two-account comparison** — category spend deltas, shared/unique categories, and a confidence-scored memory of which of two accounts has consistently run higher in a category over time.
+- **Voice advisor** — OpenAI Realtime API enables spoken queries with personalised, data-driven responses and built-in guardrails, across Insights, Macro, Compare, and Recommendations.
+
+---
+
+## Macro
+
+The Macro page (`/macro`) puts the user's own balance in the context of the wider economy:
+
+- **Indicators** — RBI Repo Rate, Inflation (CPI), Food Inflation, GDP Growth, and GDP per Capita, sourced from the World Bank API plus manually-curated RBI/MoSPI seed data (MoSPI preferred over World Bank for inflation/GDP growth where available, since it publishes more recent figures).
+- **Erosion synthesis** — a server-composed "what this means for you" narrative combining the live inflation rate with the user's actual balance (e.g. real purchasing-power loss per year), plus a GDP-vs-erosion comparison sentence and any relevant confirmed memory facts.
+- **Investment scenario slider** — an interactive what-if: adjust a hypothetical amount and assumed annual return to see the net benefit against inflation. Purely a client-side calculation on already-fetched numbers — not recorded as a fact about the user, since it's a hypothetical, not an observation.
+- **Memory panel** — confirmed/tentative balance-trend facts, built up by the agentic memory layer across repeated visits.
+- **Two charts** — a nominal-vs-real (inflation-adjusted) balance trend, and a separate purchasing-power-gap chart isolating just the erosion amount on its own scale (a combined chart would let a structural change, like adding a new account, dominate the axis and hide the actual erosion).
+- **Voice narration** via the shared realtime voice hook.
+
+## Compare
+
+The Compare page (`/compare`) puts two of the user's bank accounts side by side — currently hard-capped at exactly two accounts, both in the UI and structurally in the underlying `semantic_facts` schema (not N-way):
+
+- **Category spend deltas** between the two accounts.
+- **Shared vs. unique spending categories.**
+- **Memory panel** — a confidence-scored, growing record of which account has consistently run higher in a shared category across repeated comparisons over time.
+- **Color-coded columns** — one color per account, fixed by selection order.
+- **Voice narration** via the shared realtime voice hook.
 
 ---
 
 ## Architecture
 
-![Oikos Ledger Architecture](https://github.com/sl2902/oikos_ledger/blob/main/assets/oikos_ledger_architecture.png)
+![Oikos Ledger Architecture](https://github.com/sl2902/oikos_ledger/blob/main/assets/oikos_recall_architecture_diagram.png)
 
 **Tech stack:**
 - Frontend: Next.js 15 App Router, TypeScript, Tailwind CSS, shadcn/ui — deployed on Vercel
 - Ingestion: Python 3.12 Lambda, invoked directly by the Next.js upload API route after storing the file in S3
-- Database: Aurora PostgreSQL Serverless v2, pgvector extension
+- Database: CockroachDB Cloud (Basic tier, Mumbai / ap-south-1) — native Distributed Vector Indexing (VECTOR columns) and PostGIS-compatible spatial types, no separate pgvector/PostGIS extension install required (see ADR 014)
 - AI: OpenAI GPT-4o-mini (NL→SQL, recommendations), text-embedding-3-small (semantic cache), Realtime API (voice)
 - Auth: NextAuth v5, Google OAuth
 
@@ -86,6 +111,8 @@ If you want to start fresh as a guest:
 - **Insights** — type or speak a question (e.g. *"Plot my food expenses for the last 3 months"*)
 - **Recommendations** — spending vs 3-month baseline with projected overspend
 - **Analytics** — merchant breakdown, payment method trends, subcategory drilldown, debit vs credit
+- **Macro** — economic indicators, a personalised erosion narrative, an investment scenario slider, and a balance-trend memory panel (voice-enabled)
+- **Compare** — pick two of your accounts to see category spend deltas, shared/unique categories, and a growing memory of which account runs higher where (voice-enabled)
 
 > Note: Demo statements have been uploaded until July 15 to ensure recommendations show live current-month data during the judging period.
 
@@ -99,7 +126,13 @@ If you want to start fresh as a guest:
 | CockroachDB tool #2 | Distributed Vector Indexing (semantic recall over past insights) |
 | AWS service | Lambda, Python 3.12 (scheduled batch distillation job) |
 
-**Note on vector similarity:** The fact-similarity check that grounds the agent's responses (Insights, Macro, Compare) computes cosine similarity server-side inside CockroachDB via the `<=>` operator (`1 - (embedding <=> ...)`), with the database doing the relevance ranking natively — not in application code. This wasn't the original design: an earlier version fetched every confirmed fact's raw embedding vector via MCP and computed similarity in JavaScript, which turned out to hit the Managed MCP Server's response-size cap once a user had more than one confirmed fact (see `docs/challenges.md` #17). Moving the computation into CockroachDB fixed that and is a more direct exercise of Distributed Vector Indexing than the original approach was.
+**Note on vector similarity:** this isn't one mechanism — it's three, doing different jobs, and they shouldn't be collapsed into a single claim:
+
+- **`query_cache`'s Tier 2 similarity cache** (`getSimilarCacheHits`, and the voice-specific direct-serve path in `getVoiceSimilarCacheHit`) genuinely computes cosine similarity server-side inside CockroachDB via the `<=>` operator (`1 - (query_embedding <=> ...)`), with the database doing the ranking natively. This answers "is this whole question basically the same as one already answered" — text mode surfaces a match above 0.85 as a clickable suggestion; voice serves a match above a stricter 0.92 directly, with no suggestion step, since voice has no menu UX to confirm through.
+- **Insights' fact-grounding** (`getRelevantFactDescriptions`, which decides which confirmed memory facts ground a response) computes cosine similarity in **application code** against a cached candidate set, not via CockroachDB's `<=>` operator. This is a deliberate, safe design choice, not a regression: the confirmed-fact set for a user+account is cacheable (it only changes when distillation writes), but which facts match a specific question never is — caching the embeddings once per cache miss and scoring them in JavaScript on every question avoids sending a bulk-embedding query to the Managed MCP Server on every single question, which is exactly the shape that caused the response-size failure below.
+- **Macro and Compare** pass their confirmed facts directly to the LLM with no similarity search step at all — their candidate sets are structurally tiny by construction (Macro: one allow-listed fact type, one user, capped at 5 rows; Compare: scoped to exactly the two accounts being compared), so a ranking step over them wouldn't change what gets returned.
+
+This wasn't the original design for the fact-grounding case: an earlier version fetched every confirmed fact's raw embedding vector via MCP in one bulk query and scored it in JavaScript, which hit the Managed MCP Server's response-size cap once a user had more than one confirmed fact (see `docs/challenges.md` #17). The fix at the time moved scoring into CockroachDB via `<=>` to avoid ever returning a raw embedding column. Since then, candidate-set caching was reintroduced with a safer shape (each confirmed fact's embedding fetched via its own single-row MCP call, cached, and paid for only on a cache miss rather than per question) — which is what put scoring back into application code specifically for this path. `query_cache`'s Tier 2 was never affected by any of this and has computed similarity in CockroachDB via `<=>` throughout — it's the one part of the original claim that's fully accurate as stated.
 
 **Note on MCP Server access control:** CockroachDB's Managed MCP Server scopes access at the whole-cluster Cloud RBAC level (the Cluster Operator role, in this project's case) for autonomous API-key connections — there is no platform-level mechanism to restrict a given connection to read-only, or to specific tables or operations. The read/write separation between this project's interactive path (read-only in practice) and its distillation path (read/write) is enforced in application code, not by the platform: the interactive path simply never issues write-shaped MCP tool calls (`insert_rows`, `create_table`, `create_database`). This is a deliberate, understood design choice given what the platform actually offers today, not an oversight.
 
@@ -133,20 +166,25 @@ uv sync
 
 #### Frontend (`app/.env.local`)
 ```env
-# Database
-DATABASE_URL=postgresql://user:password@your-aurora-endpoint:5432/oikos
-DATABASE_URL_DIRECT=postgresql://user:password@your-aurora-endpoint:5432/oikos
-DB_PROVIDER=aurora
+# Database — CockroachDB Cloud (Postgres-wire-compatible; see ADR 014)
+DATABASE_URL=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
+DATABASE_URL_DIRECT=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
+DATABASE_URL_READONLY=postgresql://readonly_user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
+
+# CockroachDB Managed MCP Server (agentic memory reads/writes)
+COCKROACHDB_MCP_API_KEY=your-mcp-api-key
+COCKROACHDB_MCP_CLUSTER_ID=your-cluster-uuid
 
 # Auth
 NEXTAUTH_URL=http://localhost:3000
-NEXTAUTH_SECRET=your-secret-here
+AUTH_SECRET=your-secret-here
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
 
 # OpenAI
 OPENAI_API_KEY=sk-proj-...
 OPENAI_REALTIME_API_KEY=sk-proj-...
+# OPENAI_BASE_URL=              # set to use a proxy; omit to call api.openai.com directly
 
 # AWS
 AWS_REGION=ap-south-1
@@ -157,9 +195,11 @@ AWS_LAMBDA_FUNCTION_NAME=oikos-ledger-ingestion
 NEXT_PUBLIC_VOICE_ENABLED=true
 ```
 
+Note: guest login (`demo@oikosledger.app`) needs no special environment variable — it resolves its user id via a normal DB lookup by email, same as any other user. See step 2 of AWS setup below for creating the demo user row.
+
 #### Ingestion (`ingestion/.env`)
 ```env
-DATABASE_URL=postgresql://user:password@your-aurora-endpoint:5432/oikos
+DATABASE_URL=postgresql://user:password@your-cluster.cockroachlabs.cloud:26257/oikos?sslmode=require
 AWS_S3_BUCKET=your-s3-bucket
 AWS_LAMBDA_FUNCTION_NAME=oikos-ledger-ingestion
 OPENAI_API_KEY=sk-proj-...
@@ -168,14 +208,9 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 
 ### AWS setup
 
-#### 1. Aurora PostgreSQL Serverless v2
-Use the **full configuration** wizard in the AWS console — do not use express creation.
+#### 1. CockroachDB Cloud cluster
 
-```bash
-# Enable pgvector after cluster is ready
-psql $DATABASE_URL -c "CREATE EXTENSION IF NOT EXISTS vector;"
-psql $DATABASE_URL -c "CREATE EXTENSION IF NOT EXISTS postgis;"
-```
+Create a cluster (Basic tier is sufficient — it autoscales on demand, no manual min/max capacity knob or cold-start pause behaviour to work around, unlike Aurora Serverless v2). Distributed Vector Indexing (VECTOR columns) and PostGIS-compatible spatial types are native to the engine — no extension install step is needed (see ADR 014). See `docs/deployment.md` for the full current environment/variable reference.
 
 #### 2. Run database migrations
 
@@ -184,21 +219,14 @@ cd app
 npx drizzle-kit push
 ```
 
-Then create the demo guest user:
+Then create the demo guest user (no manual UUID wiring needed — guest login resolves `demo@oikosledger.app` via a normal DB lookup by email, same path every other user goes through):
 
 ```sql
 INSERT INTO users (email, first_name, last_name, country_code, currency)
 VALUES ('demo@oikosledger.app', 'Demo', 'User', 'IN', 'INR');
 
--- Note the generated UUID and use it below
 INSERT INTO bank_accounts (user_id, bank_name, account_type, currency)
-VALUES ('<user-uuid-from-above>', 'HDFC Bank', 'savings', 'INR');
-```
-
-Update `app/auth.ts` with the generated user UUID:
-```typescript
-// In the Credentials provider authorize() and jwt() callback
-token["userId"] = "<your-demo-user-uuid>"
+VALUES ((SELECT id FROM users WHERE email = 'demo@oikosledger.app'), 'HDFC Bank', 'savings', 'INR');
 ```
 
 #### 3. S3 bucket
@@ -208,9 +236,17 @@ aws s3api put-bucket-cors --bucket your-bucket-name --cors-configuration file://
 ```
 
 #### 4. Lambda deployment
+
+First time only — creates the Lambda execution role:
 ```bash
-cd ingestion
-./deploy.sh  # or your deployment script
+chmod +x scripts/setup_lambda_role.sh
+./scripts/setup_lambda_role.sh
+```
+
+Then, from the repo root (see `docs/deployment.md` for what this script does step by step):
+```bash
+chmod +x scripts/deploy_lambda.sh
+./scripts/deploy_lambda.sh
 ```
 
 Set these environment variables on the Lambda function:
