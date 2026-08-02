@@ -71,7 +71,7 @@ The Compare page (`/compare`) puts two of the user's bank accounts side by side 
 
 ## Data model
 
-![Oikos Recall Data Model](https://github.com/sl2902/oikos_recall/blob/main/assets/oikos_ledger_er_v1.png)
+![Oikos Recall Data Model](https://github.com/sl2902/oikos_recall/blob/main/assets/oikos_recall_er.png)
 
 ---
 
@@ -114,7 +114,7 @@ If you want to start fresh as a guest:
 - **Macro** — economic indicators, a personalised erosion narrative, an investment scenario slider, and a balance-trend memory panel (voice-enabled)
 - **Compare** — pick two of your accounts to see category spend deltas, shared/unique categories, and a growing memory of which account runs higher where (voice-enabled)
 
-> Note: Demo statements have been uploaded until July 15 to ensure recommendations show live current-month data during the judging period.
+> Note: Demo statements have been uploaded until September 15 to ensure app show live current-month data during the judging period.
 
 ---
 
