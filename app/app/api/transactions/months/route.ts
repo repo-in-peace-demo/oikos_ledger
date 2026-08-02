@@ -2,6 +2,7 @@ import { auth } from "@/auth"
 import { and, desc, eq, lte, sql } from "drizzle-orm"
 import { db } from "@/lib/db/client"
 import { transactions } from "@/lib/db/schema"
+import { todayDateString } from "@/lib/today"
 
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
@@ -27,6 +28,9 @@ export async function GET(request: Request) {
   // recent entry here) whenever nothing is explicitly selected yet, so without this bound a fresh
   // session would land straight on a future month from seed/demo data extending past today (e.g.
   // seeded through Sep 15 to cover an uncertain judging window) instead of the real current month.
+  // Bounded at todayDateString() (the app server's own clock), not SQL's CURRENT_DATE — see that
+  // function's doc comment for why trusting two independently-evaluated clocks for the same
+  // boundary is itself a source of exactly this kind of off-by-one.
   const rows = await db
     .selectDistinct({ month_key: monthKeyExpr })
     .from(transactions)
@@ -34,7 +38,7 @@ export async function GET(request: Request) {
       and(
         eq(transactions.user_id, session.user.id),
         eq(transactions.account_id, account_id),
-        lte(transactions.transaction_date, sql`CURRENT_DATE`),
+        lte(transactions.transaction_date, todayDateString()),
       ),
     )
     .orderBy(desc(monthKeyExpr))
