@@ -5,6 +5,7 @@ import OpenAI from "openai"
 import { logError } from "@/lib/logger"
 import { getQueryCacheDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
 import { loadFactCandidates } from "@/lib/insights/factCandidates"
+import { todayDateString } from "@/lib/today"
 
 export const dynamic = "force-dynamic"
 
@@ -1242,9 +1243,18 @@ export async function POST(request: Request) {
 
   const dedupedHistory = dedupeConsecutive(conversation_history ?? [])
 
+  // date_to defaults to today (the app server's own clock, via todayDateString() — not SQL's
+  // CURRENT_DATE, see that function's doc comment for why trusting two independently-evaluated
+  // clocks for the same boundary is itself a source of off-by-one exclusions) rather than being
+  // left unbounded when absent. The pre-built intents below (and monthly_trend's own
+  // granularity-detection query) are plain SQL templates, not LLM-generated — without this
+  // default, a pre-built intent run with no explicit date filter would include future-dated
+  // seed/demo data (e.g. seeded ahead through Sep 15 to cover an uncertain judging window) as if
+  // it had already happened. An explicit date_to from the UI's own date picker still wins — this
+  // only fills the gap when nothing was explicitly requested.
   const dateFilter = [
     date_from ? `AND transaction_date >= '${date_from}'` : "",
-    date_to ? `AND transaction_date <= '${date_to}'` : "",
+    date_to ? `AND transaction_date <= '${date_to}'` : `AND transaction_date <= '${todayDateString()}'`,
   ].join(" ")
 
   const dateContext = date_from || date_to

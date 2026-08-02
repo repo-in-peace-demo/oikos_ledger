@@ -1,5 +1,5 @@
 // Compares distilled memory (episodic_events + semantic_facts) across two or more of the user's accounts
-import { and, eq, gte, sql } from "drizzle-orm"
+import { and, eq, gte, lte, sql } from "drizzle-orm"
 import { after } from "next/server"
 import { auth } from "@/auth"
 import { db, dbReadonly } from "@/lib/db/client"
@@ -12,6 +12,7 @@ import {
 import { generateEmbedding } from "@/lib/embeddings"
 import { logError } from "@/lib/logger"
 import { mcpSelectQuery } from "@/lib/mcp/client"
+import { todayDateString } from "@/lib/today"
 
 export const dynamic = "force-dynamic"
 
@@ -166,10 +167,20 @@ async function loadAccountMemory(userId: string, accountId: string): Promise<Omi
 // queried directly via the app's own db client (same as /api/analytics), not mcpSelectQuery,
 // since transactions is a normal high-traffic table the app already has full grants on; MCP reads
 // in this route are reserved for the memory tables (episodic_events/semantic_facts).
+//
+// Upper-bounded at `until` as well as lower-bounded at `since` — demo/seed data can legitimately
+// extend past today (e.g. to cover an uncertain judging window), and without the upper bound this
+// "trailing 30 days" window would also sum up future-dated rows that haven't happened yet,
+// inflating both the live category_deltas and the category_spend_snapshot events this feeds into
+// distillation (which would otherwise bake the inflated total into a category_baseline fact's
+// running_mean). `until` is the caller's own todayDateString(), not SQL's CURRENT_DATE — see that
+// function's doc comment for why trusting two independently-evaluated clocks for the same boundary
+// is itself a source of exactly this kind of off-by-one.
 async function getCategorySpendTotals(
   userId: string,
   accountId: string,
   since: string,
+  until: string,
 ): Promise<{ category: string; amount: number }[]> {
   const rows = await db
     .select({
@@ -182,6 +193,7 @@ async function getCategorySpendTotals(
       eq(transactions.account_id, accountId),
       eq(transactions.transaction_type, "debit"),
       gte(transactions.transaction_date, since),
+      lte(transactions.transaction_date, until),
     ))
     .groupBy(transactions.category)
 
@@ -198,14 +210,16 @@ async function recordCategorySpendSnapshots(
   userId: string,
   accounts: AccountMemory[],
 ): Promise<void> {
-  const since = new Date(Date.now() - CATEGORY_SNAPSHOT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+  const now = new Date()
+  const until = todayDateString(now)
+  const since = new Date(now.getTime() - CATEGORY_SNAPSHOT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10)
 
   const perAccountTotals = await Promise.all(
     accounts.map(async (acc) => ({
       account: acc,
-      totals: await getCategorySpendTotals(userId, acc.account_id, since),
+      totals: await getCategorySpendTotals(userId, acc.account_id, since, until),
     })),
   )
 

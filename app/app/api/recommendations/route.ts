@@ -3,6 +3,7 @@ import { auth } from "@/auth"
 import { db } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import OpenAI from "openai"
+import { todayDateString } from "@/lib/today"
 
 export const dynamic = "force-dynamic"
 
@@ -30,6 +31,10 @@ export async function POST(req: Request) {
   const dayOfMonth = now.getDate()
   const elapsedFraction = dayOfMonth / daysInMonth
   const currentMonthKey = `${currentYear}-${String(currentMonth).padStart(2, "0")}`
+  // Derived from `now` above, not a separately-evaluated CURRENT_DATE in SQL — see todayDateString's
+  // own doc comment for why trusting two independent clocks for the same boundary silently excludes
+  // today's own transactions from "spent so far this month" on some days but not others.
+  const todayStr = todayDateString(now)
 
   // Check if user has any data at all
   const { rows: checkRows } = await db.execute(sql.raw(`
@@ -60,8 +65,8 @@ export async function POST(req: Request) {
     WHERE user_id = '${userId}'
       AND account_id = '${account_id}'
       AND transaction_type = 'debit'
-      AND transaction_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months'
-      AND transaction_date <= CURRENT_DATE
+      AND transaction_date >= DATE_TRUNC('month', '${todayStr}'::date) - INTERVAL '3 months'
+      AND transaction_date <= '${todayStr}'
       AND category != 'Other'
     GROUP BY category, month
     ORDER BY category, month
@@ -90,12 +95,19 @@ export async function POST(req: Request) {
   let isStale = false
 
   if (!hasCurrentMonthSpend) {
+    // Bounded at todayStr (the app server's own "today", not a separately-evaluated CURRENT_DATE)
+    // for the same reason noted above: without an upper bound at all, MAX(transaction_date) could
+    // return a future-dated month from seed/demo data extending past today (e.g. seeded through
+    // Sep 15 to cover an uncertain judging window), making the fallback jump straight to that
+    // future month as if it were the most recently completed one — the same class of bug as
+    // Macro's "latest balance," just for "most recent uploaded month" instead.
     const { rows: recentMonthRows } = await db.execute(sql.raw(`
       SELECT TO_CHAR(MAX(transaction_date), 'YYYY-MM') AS recent_month
       FROM transactions
       WHERE user_id = '${userId}'
         AND account_id = '${account_id}'
         AND transaction_type = 'debit'
+        AND transaction_date <= '${todayStr}'
     `))
 
     const recentMonth = (recentMonthRows[0] as any)?.recent_month as string | null
@@ -114,7 +126,7 @@ export async function POST(req: Request) {
           AND account_id = '${account_id}'
           AND transaction_type = 'debit'
           AND transaction_date >= DATE_TRUNC('month', TO_DATE('${recentMonth}', 'YYYY-MM')) - INTERVAL '3 months'
-          AND transaction_date <= CURRENT_DATE
+          AND transaction_date <= '${todayStr}'
           AND category != 'Other'
         GROUP BY category, month
         ORDER BY category, month

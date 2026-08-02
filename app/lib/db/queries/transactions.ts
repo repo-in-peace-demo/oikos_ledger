@@ -1,6 +1,7 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm"
+import { and, desc, eq, inArray, lte } from "drizzle-orm"
 import { db } from "@/lib/db/client"
 import { merchants, transaction_amendments, transactions, uploads } from "@/lib/db/schema"
+import { todayDateString } from "@/lib/today"
 import type { UploadStatus } from "@/types"
 
 export async function getTransactionsByAccount(
@@ -20,6 +21,13 @@ export async function getTransactionsByAccount(
 
 // Most recent closing balance for an account, and the YYYY-MM month it's from. Returns null if
 // the account has no transactions at all (caller should exclude it, not treat it as a zero balance).
+// Excludes future-dated rows (transaction_date > today) — demo/seed data can legitimately extend
+// past today (e.g. to cover an uncertain judging window), and without this filter the "latest"
+// balance would jump straight to that future date's figure instead of gradually catching up to it
+// as real time passes, defeating the point of seeding ahead. Bounded at todayDateString() (the app
+// server's own clock), not SQL's CURRENT_DATE — see that function's doc comment for why trusting
+// two independently-evaluated clocks for the same boundary is itself a source of exactly this kind
+// of off-by-one.
 export async function getLatestAccountBalance(userId: string, accountId: string): Promise<{
   closing_balance: number
   as_of_month: string
@@ -30,7 +38,11 @@ export async function getLatestAccountBalance(userId: string, accountId: string)
       transaction_date: transactions.transaction_date,
     })
     .from(transactions)
-    .where(and(eq(transactions.user_id, userId), eq(transactions.account_id, accountId)))
+    .where(and(
+      eq(transactions.user_id, userId),
+      eq(transactions.account_id, accountId),
+      lte(transactions.transaction_date, todayDateString()),
+    ))
     .orderBy(desc(transactions.transaction_date), desc(transactions.row_number))
     .limit(1)
 
