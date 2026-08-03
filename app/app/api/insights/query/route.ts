@@ -801,6 +801,22 @@ Columns:
   - currency (text)
 
 SQL Rules (always enforced):
+  - Generate EXACTLY ONE run_sql call per turn, never more than one —
+    the tool only ever executes a single query, and calling it more than
+    once in the same turn produces concatenated tool-call arguments that
+    cannot be parsed as JSON, crashing the request instead of answering it.
+    When a question asks for multiple related values, work out whether
+    they can ALL be derived from ONE query's result set before writing
+    any SQL — they almost always can.
+    Example — "balance for last month, including starting balance,
+    ending balance, and daily changes": this is NOT three queries (one
+    for the trend, one for the first row, one for the last row). It is
+    ONE query for the daily closing_balance trend across the month;
+    the starting balance is simply that result's first row, and the
+    ending balance is simply its last row — read them off the one
+    result set when composing the answer, never issue a second or
+    third query just to re-fetch a value the first query's rows
+    already contain.
   - Only SELECT queries
   - Always include:
     WHERE user_id = '${userId}' AND account_id = '${accountId}'
@@ -974,9 +990,19 @@ function enforceBalanceLanguageGuard(
   return "This reflects your net cash flow (credits minus debits) for the period, not your actual account balance — ask specifically about your balance to see the real closing_balance figure."
 }
 
+// "direct_response" is a genuine, successfully-composed answer (the model chose not to call
+// run_sql at all — e.g. a clarifying question, or an off-topic refusal, or answering directly
+// from memory context already in the prompt) — used_memory can legitimately be true here.
+// "failure" is distinct on purpose: parseToolCall crashing, or the generated SQL failing
+// validation, are pipeline failures, not answers — nothing was actually composed using the
+// fact-similarity match, so used_memory must never be true for this variant regardless of
+// whether a match was found. Keeping these as separate types (rather than one "direct_response"
+// with an isFailure flag easy to forget to check) makes it a type error to derive used_memory
+// from anything other than which variant actually came back.
 type AgentResult =
   | { type: "sql_result"; sql: string; rows: Record<string, unknown>[]; summary: string; chartType: string }
   | { type: "direct_response"; response: string }
+  | { type: "failure"; response: string }
 
 async function runAgentLoop(
   question: string,
@@ -1090,16 +1116,23 @@ async function runAgentLoop(
       question,
       toolCallArgs,
     })
+    // "failure", not "direct_response" — this is a crashed pipeline, not an answer, and must
+    // never be reported as used_memory: true just because a fact-similarity match happened to
+    // exist for this question. Wording is deliberately distinct from both the off-topic refusal
+    // above and the realtime voice advisor's own off-topic phrasing — this is a technical
+    // query-building hiccup, not a scope rejection, and must never read like one.
     return {
-      type: "direct_response",
-      response: "I had trouble generating the query. Could you rephrase?",
+      type: "failure",
+      response: "I had trouble putting that query together — could you rephrase the question?",
     }
   }
 
   const validation = validateSQL(parsedSQL)
   if (!validation.valid) {
+    // Also "failure", not "direct_response" — same reasoning as the parse-error branch above:
+    // nothing was actually answered, so used_memory must never be true here either.
     return {
-      type: "direct_response",
+      type: "failure",
       response: "I can only run SELECT queries on your transaction data.",
     }
   }
@@ -1722,7 +1755,32 @@ Summarize these results accurately.`,
     )
   }
 
-  // Direct response — clarification or off-topic
+  // Failure — parseToolCall crashed, or the generated SQL failed validation. Nothing was
+  // actually answered using the fact-similarity match, so used_memory is unconditionally false
+  // here — never relevantFacts.length > 0, regardless of whether a match was found. This is the
+  // structural fix: used_memory is gated on the pipeline having actually succeeded (this branch
+  // is unreachable unless it didn't), not on the match having occurred.
+  if (agentResult.type === "failure") {
+    return Response.json({
+      type: "complete",
+      question,
+      intent: "finance_custom",
+      intent_label: "Response",
+      intent_description: "",
+      is_custom: true,
+      sql: "",
+      results: [],
+      response: agentResult.response,
+      chart_type: "none",
+      row_count: 0,
+      cached: false,
+      used_memory: false,
+    })
+  }
+
+  // Direct response — a genuine answer (clarification, off-topic refusal, or answered directly
+  // from memory context already baked into the prompt, no tool call needed) — the pipeline
+  // succeeded, so used_memory can legitimately reflect whether a fact-similarity match was found.
   if (agentResult.type === "direct_response") {
     return Response.json({
       type: "complete",
