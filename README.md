@@ -1,10 +1,10 @@
 # Oikos Recall
 
-> *When did you last ask your bank statement a plain English question?*
+> *When did you last ask your bank statement a plain English question and have it remember what it told you last time?
 
-Oikos Recall is a conversational personal finance app that turns Indian bank statements into charts, trends, and AI-powered spending insights — just by asking. Built for the AWS + Vercel Hackathon 2026 (Track 1 B2C).
+Oikos Recall is a conversational personal finance app that turns Indian bank statements into charts, trends, and AI-powered spending insights, just by asking, and remembers what it has told you over time. Built for the CockroachDB × AWS Hackathon (Submission Period June 30 – Aug 18, 2026), extending Oikos Ledger, a personal finance app originally built for the AWS + Vercel Hackathon 2026 (Track 1 B2C).
 
-**Live demo:** https://oikosledger.vercel.app
+**Live demo:** https://oikos-recall.vercel.app
 
 ---
 
@@ -89,7 +89,7 @@ The agentic memory layer is built around a three-stage design:
 
 ## For judges
 
-The app is live at **https://oikosledger.vercel.app**.
+The app is live at **https://oikos-recall.vercel.app**.
 
 ### Guest access
 Click **Try as Guest** on the login page. No Google account required. The guest account is pre-seeded with 3 months of realistic HDFC Bank transactions (April–June 2026) covering food, groceries, pharmacy, utilities, shopping, and dividend income.
