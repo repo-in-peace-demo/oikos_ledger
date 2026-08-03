@@ -55,6 +55,20 @@ const FACT_SIMILARITY_LIMIT = 3
 // "err toward reliability" instruction. Flagging this explicitly as a judgment call, same as before.
 const FACT_QUERY_TIMEOUT_MS = 6500
 
+// Page-load prefetch (see the `prefetch` branch below) calls this same function purely to warm
+// the MCP connection/candidate cache before the user asks a real question — nobody is waiting on
+// it directly, so cutting it off at FACT_QUERY_TIMEOUT_MS optimizes for the wrong thing: a live
+// request needs to fail fast because a person is staring at a spinner; the prefetch's only job is
+// finishing before that person's first real question, and failing fast buys it nothing. Confirmed
+// live: an embedding call alone took 3742ms — already past half of FACT_QUERY_TIMEOUT_MS on its
+// own — and the whole prefetch timed out at 6502ms with the cache never populated, so the user's
+// first real question still hit the same slow, cold path the prefetch exists to prevent. 15000ms
+// gives real margin over that observed 3742ms embedding time plus the documented MCP round-trip
+// worst case (up to 6246ms) — well past the combined ~9000ms+ worst case this file's own timeout
+// comment says a live request can't afford to wait for, which is exactly the budget a background
+// warm-up call CAN afford.
+const PREFETCH_FACT_QUERY_TIMEOUT_MS = 15000
+
 const BLOCKED_KEYWORDS = [
   "drop", "delete", "update", "insert", "truncate",
   "alter", "create", "grant", "revoke", "exec",
@@ -384,6 +398,7 @@ async function getRelevantFactDescriptions(
   accountId: string,
   isolatedQuestionText: string,
   contextualQueryText: string,
+  timeoutMs: number = FACT_QUERY_TIMEOUT_MS,
 ): Promise<string[]> {
   const startedAt = Date.now()
 
@@ -489,7 +504,7 @@ async function getRelevantFactDescriptions(
     setTimeout(() => {
       timedOut = true
       resolve("timeout")
-    }, FACT_QUERY_TIMEOUT_MS)
+    }, timeoutMs)
   })
 
   // If the timeout branch wins the race below, `work` is still running — this still logs its
@@ -507,7 +522,7 @@ async function getRelevantFactDescriptions(
     if (timedOut) {
       console.error(
         `Semantic facts similarity search TIMED OUT after ${Date.now() - startedAt}ms `
-        + `(budget ${FACT_QUERY_TIMEOUT_MS}ms) — still in "${step}" when the budget ran out. `
+        + `(budget ${timeoutMs}ms) — still in "${step}" when the budget ran out. `
         + `embedding: ${embeddingMs ?? "did not finish"}ms, `
         + `load_candidates: ${candidatesMs ?? "did not finish"}ms `
         + `— degrading to no memory context`,
@@ -518,7 +533,7 @@ async function getRelevantFactDescriptions(
     logSimilarityOutcome(scoredAll, "used")
     console.log(
       `Semantic facts similarity search completed in ${Date.now() - startedAt}ms `
-      + `(embedding: ${embeddingMs}ms, load_candidates: ${candidatesMs}ms, budget ${FACT_QUERY_TIMEOUT_MS}ms)`,
+      + `(embedding: ${embeddingMs}ms, load_candidates: ${candidatesMs}ms, budget ${timeoutMs}ms)`,
     )
     return scoredAll
       .filter((c) => c.similarity > FACT_SIMILARITY_THRESHOLD)
@@ -1222,7 +1237,9 @@ export async function POST(request: Request) {
       + `${new Date(prefetchStartedAt).toISOString()}`,
     )
     try {
-      await getRelevantFactDescriptions(userId, account_id, "warm cache", "warm cache")
+      await getRelevantFactDescriptions(
+        userId, account_id, "warm cache", "warm cache", PREFETCH_FACT_QUERY_TIMEOUT_MS,
+      )
       console.log(
         `Prefetch warm-up completed in ${Date.now() - prefetchStartedAt}ms for user ${userId}, `
         + `account ${account_id}`,
