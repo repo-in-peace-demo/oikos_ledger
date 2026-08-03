@@ -1031,6 +1031,38 @@ type AgentResult =
   | { type: "direct_response"; response: string }
   | { type: "failure"; response: string }
 
+// Deterministic, code-level correction — not a substitute for the tool schema's own chart_type
+// guidance, but that's still model judgment, made fresh on every call, which is exactly what
+// let two byte-for-byte identical SQL queries (same SELECT, same WHERE, same date range) get
+// different chart_types across two near-identical questions: one "line", the other "none" — pure
+// per-call variance in a decision that should be a function of the query's actual shape, not of
+// the call. AGENT_SYSTEM_PROMPT already mandates aliasing every time column to EXACTLY "day",
+// "week", or "month" — that convention is what makes a query's shape mechanically checkable here,
+// against the ACTUAL returned rows rather than re-parsing SQL text.
+//
+// Deliberately narrow: only overrides the two chart_types the tool schema's own description
+// already says are wrong for a time series ("none" and "table" — "CRITICAL: ... never table",
+// and "none" is documented as being for a single scalar, not a multi-row series). Every other
+// choice (line, bar, comparison_bar, horizontal_bar, pie) is left as the model's own judgment —
+// this fixes the confirmed wrong answers, not a general second-guessing of chart choice.
+function deriveDeterministicChartType(
+  rows: Record<string, unknown>[],
+  modelChartType: string,
+): string {
+  if (rows.length <= 1) return modelChartType // single-row lookups legitimately get "none"
+
+  const keys = Object.keys(rows[0])
+  const timeKey = keys.find((k) => k === "day" || k === "week" || k === "month")
+  if (!timeKey) return modelChartType // not a time-series shape — trust the model as-is
+
+  if (modelChartType !== "none" && modelChartType !== "table") return modelChartType
+
+  // Debit/credit-by-period is the one time-series shape with a dedicated non-line chart_type
+  // (comparison_bar) — everything else with exactly one non-time numeric column is a plain trend.
+  const nonTimeKeys = keys.filter((k) => k !== timeKey)
+  return nonTimeKeys.length === 2 ? "comparison_bar" : "line"
+}
+
 async function runAgentLoop(
   question: string,
   userId: string,
@@ -1075,9 +1107,9 @@ async function runAgentLoop(
               - comparison_bar: exactly two numeric values per time period (debits AND credits by month)
               - pie: category breakdown showing proportions/percentages of a whole
               - table: multi-dimension results, raw transaction lists, or anything with 3+ columns
-              - none: single scalar answer (one number, e.g. "total spent in March")
+              - none: single scalar answer (one number, e.g. "total spent in March") — ONLY when the query returns exactly one row. A query with a time column that returns MORE than one row is a series, never a scalar, even if the question is phrased like "what's my balance" or "explain my balance" rather than "trend"/"over time" — the wording of the question does not change what chart_type a given query shape requires.
 
-              CRITICAL: If the query has a time column (day/week/month/date), ALWAYS use line, bar, or comparison_bar — never table.`,
+              CRITICAL: If the query has a time column (day/week/month/date) AND returns more than one row, ALWAYS use line, bar, or comparison_bar — never table, and never none. This is a property of the query's shape (how many rows it returns), not of how the question happened to be phrased — the same query shape must always get the same chart_type, whether this is the first time you've generated it this conversation or the tenth.`,
             },
           },
           required: ["sql", "chart_type"],
@@ -1197,7 +1229,7 @@ async function runAgentLoop(
 
   const totalDebits = rows.reduce((sum, r) => sum + Number(r.debits ?? 0), 0)
   const totalCredits = rows.reduce((sum, r) => sum + Number(r.credits ?? 0), 0)
-  const inferredChartType = inferredAgentChart || "table"
+  const inferredChartType = deriveDeterministicChartType(rows, inferredAgentChart || "table")
 
   const synthesisMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     ...toolResultMessages,
