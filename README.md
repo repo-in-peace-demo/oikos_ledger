@@ -96,8 +96,8 @@ Click **Try as Guest** on the login page. No Google account required. The guest 
 
 ### Testing the upload
 1. Sign in as guest (or with your own Google account)
-2. Download a sample statement: [`demo_hdfc_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv?token=GHSAT0AAAAAAD5KQNSGVRDX6Q62VFBXDE5K2TREBFQ)
-3. Download a sample Axis bank statement: [`demo_axis_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_axis_statement_full.csv?token=GHSAT0AAAAAAD5KQNSG5FPIXE7LTWLEY7BK2TRECDA)
+2. Download a sample statement: [`demo_hdfc_statement.csv`](https://github.com/sl2902/oikos_recall/raw/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv)
+3. Download a sample Axis bank statement: [`demo_axis_statement.csv`](https://github.com/sl2902/oikos_recall/raw/refs/heads/main/ingestion/tests/fixtures/demo/demo_axis_statement_full.csv)
 4. On the Transactions page, click **Upload Statement** in the top right corner
 5. Select HDFC Bank and upload the CSV
 6. Wait ~30–60 seconds for Lambda to process
@@ -112,6 +112,8 @@ If you want to start fresh as a guest:
 ### Exploring features
 - **Transactions** — filter by month, category, payment method, merchant search, custom date range
 - **Insights** — type or speak a question (e.g. *"Plot my food expenses for the last 3 months"*)
+  - To specifically demonstrate memory retrieval: ask *"How has my balance been lately?"* or *"Tell me about my balance trends"*. If a confirmed pattern already exists for this account, the response is grounded in it — text mode shows a 🧠 from memory badge on the reply, voice mode speaks the reference naturally (e.g. "I've noticed that...").
+  - Not every question retrieves a fact, by design — the quick-question shortcuts (Monthly trend, Biggest expenses, etc.) skip the memory search entirely, and a category with no confirmed pattern yet correctly retrieves nothing rather than inventing one. If you want the clearest, phrasing-independent demonstration of the same memory mechanism (tentative → confirmed) instead of hunting for the right question here, see Macro's and Compare's own memory panels below — both show it directly.
 - **Recommendations** — spending vs 3-month baseline with projected overspend
 - **Analytics** — merchant breakdown, payment method trends, subcategory drilldown, debit vs credit
 - **Macro** — economic indicators, a personalised erosion narrative, an investment scenario slider, and a balance-trend memory panel (voice-enabled)
