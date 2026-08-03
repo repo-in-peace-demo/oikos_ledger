@@ -96,10 +96,11 @@ Click **Try as Guest** on the login page. No Google account required. The guest 
 
 ### Testing the upload
 1. Sign in as guest (or with your own Google account)
-2. Download a sample statement: [`demo_hdfc_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv)
-3. On the Transactions page, click **Upload Statement** in the top right corner
-4. Select HDFC Bank and upload the CSV
-5. Wait ~30–60 seconds for Lambda to process
+2. Download a sample statement: [`demo_hdfc_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_hdfc_statement_full.csv?token=GHSAT0AAAAAAD5KQNSGVRDX6Q62VFBXDE5K2TREBFQ)
+3. Download a sample Axis bank statement: [`demo_axis_statement.csv`](https://raw.githubusercontent.com/sl2902/oikos_recall/refs/heads/main/ingestion/tests/fixtures/demo/demo_axis_statement_full.csv?token=GHSAT0AAAAAAD5KQNSG5FPIXE7LTWLEY7BK2TRECDA)
+4. On the Transactions page, click **Upload Statement** in the top right corner
+5. Select HDFC Bank and upload the CSV
+6. Wait ~30–60 seconds for Lambda to process
 
 ### Resetting guest data
 If you want to start fresh as a guest:
