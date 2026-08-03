@@ -1,7 +1,11 @@
 import { auth } from "@/auth"
 import { dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
-import { getQueryCacheDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
+import {
+  getQueryCacheDataMarkerOrUnknown,
+  isCacheEntryFresh,
+  isMemoryStatusServable,
+} from "@/lib/queryCacheFreshness"
 
 export const dynamic = "force-dynamic"
 
@@ -48,6 +52,16 @@ export async function POST(request: Request) {
     // client's existing error handling for this endpoint already covers it.
     const currentMarker = await getQueryCacheDataMarkerOrUnknown(userId, account_id)
     if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
+      return Response.json(
+        { error: "Cache entry not found or expired" },
+        { status: 404 },
+      )
+    }
+
+    // A response composed while the fact-similarity search was timing out/erroring shouldn't be
+    // served as a stable, repeated answer just because it happened to get cached — same 404 shape
+    // as an expired/missing entry, so the client's existing error handling covers this too.
+    if (!isMemoryStatusServable(cached._memory_status)) {
       return Response.json(
         { error: "Cache entry not found or expired" },
         { status: 404 },

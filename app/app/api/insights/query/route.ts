@@ -3,7 +3,12 @@ import { db, dbReadonly } from "@/lib/db/client"
 import { sql } from "drizzle-orm"
 import OpenAI from "openai"
 import { logError } from "@/lib/logger"
-import { getQueryCacheDataMarkerOrUnknown, isCacheEntryFresh } from "@/lib/queryCacheFreshness"
+import {
+  type FactRetrievalStatus,
+  getQueryCacheDataMarkerOrUnknown,
+  isCacheEntryFresh,
+  isMemoryStatusServable,
+} from "@/lib/queryCacheFreshness"
 import { loadFactCandidates } from "@/lib/insights/factCandidates"
 import { todayDateString } from "@/lib/today"
 
@@ -399,7 +404,7 @@ async function getRelevantFactDescriptions(
   isolatedQuestionText: string,
   contextualQueryText: string,
   timeoutMs: number = FACT_QUERY_TIMEOUT_MS,
-): Promise<string[]> {
+): Promise<{ status: FactRetrievalStatus; facts: string[] }> {
   const startedAt = Date.now()
 
   let step: "embedding" | "load_candidates" = "embedding"
@@ -527,7 +532,10 @@ async function getRelevantFactDescriptions(
         + `load_candidates: ${candidatesMs ?? "did not finish"}ms `
         + `— degrading to no memory context`,
       )
-      return []
+      // Distinct from a genuine no-match: this is a transient technical failure, not a stable
+      // "nothing relevant" outcome — a caller that caches this response must not treat it as a
+      // repeatable answer the way a real no-match is.
+      return { status: "timed_out_or_failed", facts: [] }
     }
     const scoredAll = result as { description: string; similarity: number }[]
     logSimilarityOutcome(scoredAll, "used")
@@ -535,11 +543,12 @@ async function getRelevantFactDescriptions(
       `Semantic facts similarity search completed in ${Date.now() - startedAt}ms `
       + `(embedding: ${embeddingMs}ms, load_candidates: ${candidatesMs}ms, budget ${timeoutMs}ms)`,
     )
-    return scoredAll
+    const facts = scoredAll
       .filter((c) => c.similarity > FACT_SIMILARITY_THRESHOLD)
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, FACT_SIMILARITY_LIMIT)
       .map((row) => row.description)
+    return { status: facts.length > 0 ? "used" : "no_match", facts }
   } catch (err) {
     logError({
       context: `getRelevantFactDescriptions.${step}`,
@@ -553,7 +562,9 @@ async function getRelevantFactDescriptions(
       candidatesMs,
       note: "degrading to no memory context",
     })
-    return []
+    // Same reasoning as the timeout branch above — a hard error is a technical failure, not a
+    // genuine no-match, and must be distinguishable at cache-write time.
+    return { status: "timed_out_or_failed", facts: [] }
   }
 }
 
@@ -586,6 +597,12 @@ async function getExactCacheHit(
     // serve it.
     const currentMarker = await getQueryCacheDataMarkerOrUnknown(userId, accountId)
     if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
+      return null
+    }
+    // A response composed while the fact-similarity search was timing out/erroring must never be
+    // served as a stable, repeated answer just because it happened to get cached once — treat it
+    // as a miss so this same question gets a fresh attempt instead.
+    if (!isMemoryStatusServable(cached._memory_status)) {
       return null
     }
     return cached
@@ -668,6 +685,11 @@ async function getVoiceSimilarCacheHit(
     if (!isCacheEntryFresh(cached._data_marker, currentMarker)) {
       return null
     }
+    // Same reasoning as getExactCacheHit — a response composed during a fact-search timeout/error
+    // must never be direct-served, which is an even stronger claim than a normal cache hit.
+    if (!isMemoryStatusServable(cached._memory_status)) {
+      return null
+    }
     return cached
   } catch (err) {
     logError({ context: "getVoiceSimilarCacheHit", error: err, userId, accountId, queryHash })
@@ -708,6 +730,7 @@ async function writeCacheEntry(
   queryText: string,
   embedding: number[],
   responseData: Record<string, unknown>,
+  memoryStatus: FactRetrievalStatus,
 ): Promise<void> {
   try {
     // "unknown" (timeout/failure) is stored as null, not a placeholder string — null can never
@@ -717,6 +740,10 @@ async function writeCacheEntry(
     const payload = {
       ...responseData,
       _data_marker: dataMarker === "unknown" ? null : dataMarker,
+      // See isMemoryStatusServable in queryCacheFreshness.ts — a response composed while the
+      // fact-similarity search was timing out/erroring must never be served repeatedly as a
+      // stable answer just because it happened to get cached once.
+      _memory_status: memoryStatus,
     }
     await db.execute(sql.raw(`
       INSERT INTO query_cache (
@@ -1661,6 +1688,10 @@ Summarize these results accurately.`,
             await writeCacheEntry(
               userId, account_id, queryHash,
               cacheText, embedding, responsePayload,
+              // Pre-built intent fast path never runs the fact-similarity search at all — distinct
+              // from "no_match" (which implies a search ran and found nothing) so logs don't imply
+              // a search happened here, though it's equally always safe to serve.
+              "not_applicable",
             )
           } catch (err) {
             // Reaches the client via the SSE error event below (setError in InsightsPanel), but
@@ -1725,7 +1756,7 @@ Summarize these results accurately.`,
   // Hard-timeout + degrade internally; never throws, never adds unbounded latency to a pipeline
   // the voice advisor also depends on.
   const isolatedQuestionText = question ?? cacheText
-  const relevantFacts = await getRelevantFactDescriptions(
+  const { status: memoryStatus, facts: relevantFacts } = await getRelevantFactDescriptions(
     userId, account_id, isolatedQuestionText,
     buildContextualQueryText(isolatedQuestionText, dedupedHistory),
   )
@@ -1861,6 +1892,7 @@ Summarize these results accurately.`,
         await writeCacheEntry(
           userId, account_id, queryHash,
           cacheText, embedding, responsePayload,
+          memoryStatus,
         )
       } catch (err) {
         // Reaches the client via the SSE error event below (setError in InsightsPanel), but
