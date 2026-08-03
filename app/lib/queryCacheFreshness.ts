@@ -113,3 +113,25 @@ export function isCacheEntryFresh(
   if (currentMarker === "unknown") return false
   return cachedMarker === currentMarker
 }
+
+// Status of the fact-similarity search that ran while composing a cached response — stored
+// alongside the response itself (see writeCacheEntry in app/app/api/insights/query/route.ts) so a
+// later read can tell "we genuinely checked and there was nothing relevant" (no_match — a stable,
+// legitimate outcome, most questions won't relate to whichever facts happen to be confirmed, and
+// that's fine to cache) apart from "the search timed out or errored" (timed_out_or_failed — a
+// transient technical failure that must never be served as if it were a stable, repeated answer).
+// "used" means a match was found and the response was actually composed with it in context.
+// "not_applicable" is for response paths that never run the search at all (the pre-built intent
+// fast path) — distinct from no_match so logs don't imply a search happened when it didn't, though
+// it's equally always safe to serve. Only "timed_out_or_failed" ever gates a cache read.
+export type FactRetrievalStatus = "used" | "no_match" | "timed_out_or_failed" | "not_applicable"
+
+// A cache entry is only servable if its stored memory status wasn't a transient failure — a
+// response composed while the fact-similarity search was timing out or erroring shouldn't be
+// served repeatedly as a stable answer just because it happened to get cached once. Missing
+// status (a pre-existing entry written before this field existed) passes through as servable —
+// it predates this distinction entirely and was already being served under the old, unfiltered
+// behavior, so there's nothing to newly protect against there.
+export function isMemoryStatusServable(memoryStatus: unknown): boolean {
+  return memoryStatus !== "timed_out_or_failed"
+}
