@@ -118,6 +118,7 @@ export async function loadFactCandidates(userId: string, accountId: string): Pro
   }))
 
   // Step 1: id + description only — no embedding column, safe at any row count.
+  const step1StartedAt = Date.now()
   const rows = await mcpSelectQuery<{ id: string; description: string }>(`
     SELECT id, description
     FROM semantic_facts
@@ -128,15 +129,41 @@ export async function loadFactCandidates(userId: string, accountId: string): Pro
     ORDER BY relevance_score DESC
     LIMIT ${MAX_CANDIDATE_FACTS}
   `)
+  const step1Ms = Date.now() - step1StartedAt
 
   // Step 2: each candidate's embedding via its own single-row MCP call (LIMIT 1 — the one row
   // count already confirmed safe for a query returning this column), in parallel. See this file's
   // header comment for why this can't be one bulk query instead.
+  //
+  // Per-call start/end timestamps logged below are deliberate, not incidental: a prior near-
+  // universal-timeout incident was hypothesized to be caused by these fetches running sequentially
+  // instead of in parallel — confirmed FALSE by direct code read (this was already Promise.all, not
+  // a for-loop). But this codebase's own header comment already documents 6.7s wall-clock for 10
+  // facts on this exact parallel code, which alone exceeds the live-request timeout budget
+  // (FACT_QUERY_TIMEOUT_MS = 6500ms) even without invoking session-wide latency variance. That's
+  // only possible if concurrent Promise.all dispatch from this process isn't translating into
+  // concurrent processing somewhere downstream (the shared MCP client's single transport/session in
+  // app/lib/mcp/client.ts, or session-scoped queuing on the Managed MCP Server itself) — a
+  // fundamentally different problem than a sequential loop, and one this file can't fix by changing
+  // its own JS orchestration further, since it's already correct. These timestamps make that
+  // distinction directly observable in logs next time: call start times clustered together (true
+  // concurrency, the bottleneck is elsewhere) vs. call N's start trailing close behind call N-1's
+  // end (effective serialization despite Promise.all, pointing at the shared client/transport).
+  const step2StartedAt = Date.now()
   const withEmbeddings = await Promise.all(
     rows.map(async (row) => {
+      const callStartedAt = Date.now()
       const embeddingRows = await mcpSelectQuery<{ embedding: unknown }>(`
         SELECT embedding FROM semantic_facts WHERE id = '${row.id}' LIMIT 1
       `)
+      console.log(JSON.stringify({
+        level: "info",
+        timestamp: new Date().toISOString(),
+        context: "loadFactCandidates.embeddingFetch",
+        factId: row.id,
+        startedAtMsAfterBatchStart: callStartedAt - step2StartedAt,
+        durationMs: Date.now() - callStartedAt,
+      }))
       return {
         id: row.id,
         description: row.description,
@@ -144,6 +171,19 @@ export async function loadFactCandidates(userId: string, accountId: string): Pro
       }
     }),
   )
+  const step2Ms = Date.now() - step2StartedAt
+
+  console.log(JSON.stringify({
+    level: "info",
+    timestamp: new Date().toISOString(),
+    context: "loadFactCandidates.miss",
+    userId,
+    accountId,
+    candidateCount: rows.length,
+    step1IdDescriptionMs: step1Ms,
+    step2AllEmbeddingsMs: step2Ms,
+    totalMs: step1Ms + step2Ms,
+  }))
 
   const data = withEmbeddings.filter((c) => c.embedding.length > 0)
   factCandidateCache.set(key, { marker, data })
