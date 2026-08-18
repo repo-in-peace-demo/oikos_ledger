@@ -20,7 +20,7 @@ All data in transit is encrypted via TLS.
 
 ### S3 (CSV uploads)
 
-Bucket: `oikos-ledger-uploads`
+Bucket: `oikos-recall-uploads`
 
 | Setting | Value |
 |---|---|
